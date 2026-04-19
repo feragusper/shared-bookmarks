@@ -73,7 +73,7 @@ jobs:
           node --check firebase/firebase-config.js
 
       - name: Run unit tests
-        run: node --test 'test/*.test.js'
+        run: node --test test/*.test.js
 
       - name: Stage extension files
         run: |
