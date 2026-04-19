@@ -5,9 +5,7 @@ import {
   getUser,
   createRoom,
   joinRoomByCode,
-  getRoom,
-  addBookmark,
-  listBookmarks
+  getRoom
 } from "../firebase/firestore.js";
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -35,96 +33,32 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 2500);
 }
 
-// ─── Chrome folder helpers ────────────────────────────────────────────────────
-async function getOrCreateChromeFolder() {
+// ─── Talk to the service worker ──────────────────────────────────────────────
+// All bookmark/folder sync lives in background/service-worker.js. The popup is
+// membership/invite UI only and never touches chrome.bookmarks directly.
+function requestSync() {
   return new Promise((resolve) => {
-    chrome.bookmarks.search({ title: CHROME_FOLDER_NAME }, (results) => {
-      const folder = (results || []).find(r => !r.url);
-      if (folder) return resolve(folder.id);
-      chrome.bookmarks.create({ title: CHROME_FOLDER_NAME }, (created) => {
-        resolve(created.id);
+    try {
+      chrome.runtime.sendMessage({ type: "FORCE_SYNC" }, (resp) => {
+        // ignore any lastError; the SW will run anyway
+        resolve(resp || { ok: false });
       });
-    });
+    } catch (_) { resolve({ ok: false }); }
   });
 }
 
-async function clearChromeFolder() {
-  try {
-    const folderId = await getOrCreateChromeFolder();
-    const children = await new Promise(r =>
-      chrome.bookmarks.getChildren(folderId, kids => r(kids || []))
-    );
-    for (const child of children) {
-      // removeTree handles both bookmarks and (recursively) folders
-      await new Promise(r => chrome.bookmarks.removeTree(child.id, r)).catch(() =>
-        new Promise(r => chrome.bookmarks.remove(child.id, r)).catch(() => {})
-      );
-    }
-    await chrome.storage.local.set({ lastSyncedUrls: [], lastSyncedKeys: [], lastSyncedFolderPaths: [] });
-  } catch (_) {}
-}
-
-// ─── Reconcile (Chrome ↔ Firestore), runs silently ───────────────────────────
-async function reconcileOnce() {
-  if (!state.room?.roomId || !state.user?.idToken) return;
-  try {
-    const [folderId, bookmarks] = await Promise.all([
-      getOrCreateChromeFolder(),
-      listBookmarks(state.room.roomId, state.user.idToken)
-    ]);
-
-    const children = await new Promise(r =>
-      chrome.bookmarks.getChildren(folderId, kids => r(kids || []))
-    );
-    const chromeByUrl = new Map(children.filter(c => c.url).map(c => [c.url, c]));
-    const firestoreByUrl = new Map(bookmarks.map(b => [b.url, b]));
-
-    const { lastSyncedUrls = [] } = await chrome.storage.local.get("lastSyncedUrls");
-    const lastSynced = new Set(lastSyncedUrls);
-
-    // 1) Chrome-only -> upload OR delete (if it was synced before)
-    for (const [url, node] of chromeByUrl) {
-      if (firestoreByUrl.has(url)) continue;
-      if (lastSynced.has(url)) {
-        await new Promise(r => chrome.bookmarks.remove(node.id, r)).catch(() => {});
-      } else {
-        try {
-          await addBookmark(
-            state.room.roomId,
-            {
-              url,
-              title: node.title || url,
-              favicon: "",
-              addedBy: state.user.uid,
-              addedByName: state.user.displayName || "",
-              tags: []
-            },
-            state.user.idToken
-          );
-        } catch (err) {
-          console.warn("Upload failed for", url, err);
-        }
-      }
-    }
-
-    // 2) Firestore-only -> add to Chrome
-    for (const bm of [...bookmarks].reverse()) {
-      if (!chromeByUrl.has(bm.url)) {
-        await new Promise(r => chrome.bookmarks.create(
-          { parentId: folderId, title: bm.title, url: bm.url }, r
-        )).catch(() => {});
-      }
-    }
-
-    // 3) Persist URL set
-    const finalUrls = new Set([
-      ...firestoreByUrl.keys(),
-      ...[...chromeByUrl.keys()]
-    ]);
-    await chrome.storage.local.set({ lastSyncedUrls: [...finalUrls] });
-  } catch (err) {
-    console.warn("Reconcile error:", err);
+async function openSharedFolderInChrome() {
+  const { sharedFolderId } = await chrome.storage.local.get("sharedFolderId");
+  if (sharedFolderId) {
+    chrome.tabs.create({ url: `chrome://bookmarks/?id=${sharedFolderId}` });
+    return;
   }
+  // Fallback: search by title
+  chrome.bookmarks.search({ title: CHROME_FOLDER_NAME }, (results) => {
+    const folder = (results || []).find(r => !r.url);
+    if (folder) chrome.tabs.create({ url: `chrome://bookmarks/?id=${folder.id}` });
+    else chrome.tabs.create({ url: "chrome://bookmarks/" });
+  });
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -248,7 +182,8 @@ document.getElementById("btn-join-share").addEventListener("click", async () => 
     });
     state.room = { roomId };
     await chrome.storage.local.set({ roomId });
-    await clearChromeFolder();
+    // The SW's storage.onChanged listener will reset lastSynced* and run a
+    // seed-from-remote reconcile, which merges instead of deleting.
 
     document.getElementById("share-panel").classList.remove("open");
     document.getElementById("btn-share").classList.remove("active");
@@ -275,8 +210,9 @@ async function enterMainScreen() {
   if (!state.room?.roomId) return;
 
   await refreshRoomInfo();
-  // Run a one-shot reconcile so changes catch up when popup opens.
-  reconcileOnce();
+  // Ask the SW to sync once on popup open. The SW also polls every ~30s in
+  // the background via chrome.alarms, so this is just for instant feedback.
+  requestSync();
 
   // Soft refresh of members every 8s while popup is open.
   clearInterval(state.membersTimer);
@@ -365,3 +301,4 @@ try {
 } catch (_) { /* noop */ }
 
 init();
+
