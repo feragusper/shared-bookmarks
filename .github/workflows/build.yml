@@ -72,6 +72,28 @@ jobs:
           node --check firebase/firestore.js
           node --check firebase/firebase-config.js
 
+      - name: Sanity-check service worker is not truncated
+        run: |
+          # `node --check` accepts a header-only file, so guard against the
+          # past bug where the SW shipped without its listeners.
+          for sym in \
+              "chrome.alarms.onAlarm.addListener" \
+              "chrome.bookmarks.onCreated.addListener" \
+              "chrome.bookmarks.onRemoved.addListener" \
+              "chrome.runtime.onMessage.addListener" \
+              "pullAndReconcile"; do
+            if ! grep -q "$sym" background/service-worker.js; then
+              echo "::error::service-worker.js is missing required symbol: $sym"
+              exit 1
+            fi
+          done
+          lines=$(wc -l < background/service-worker.js)
+          if [ "$lines" -lt 200 ]; then
+            echo "::error::service-worker.js is suspiciously short ($lines lines)"
+            exit 1
+          fi
+          echo "service-worker.js OK ($lines lines)"
+
       - name: Run unit tests
         run: node --test test/*.test.js
 
