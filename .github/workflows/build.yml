@@ -1,0 +1,111 @@
+name: Build extension
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute version
+        id: ver
+        run: |
+          BASE=$(node -p "require('./manifest.example.json').version.split('.').slice(0,2).join('.')")
+          VERSION="${BASE}.${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      - name: Validate required secrets
+        env:
+          FIREBASE_CONFIG_JS: ${{ secrets.FIREBASE_CONFIG_JS }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+        run: |
+          missing=0
+          if [ -z "$FIREBASE_CONFIG_JS" ]; then
+            echo "::error::Missing repository secret FIREBASE_CONFIG_JS"
+            missing=1
+          fi
+          if [ -z "$OAUTH_CLIENT_ID" ]; then
+            echo "::error::Missing repository secret OAUTH_CLIENT_ID"
+            missing=1
+          fi
+          if [ "$missing" = "1" ]; then exit 1; fi
+
+      - name: Materialize firebase/firebase-config.js
+        env:
+          FIREBASE_CONFIG_JS: ${{ secrets.FIREBASE_CONFIG_JS }}
+        run: |
+          printf '%s\n' "$FIREBASE_CONFIG_JS" > firebase/firebase-config.js
+          echo "Wrote firebase/firebase-config.js ($(wc -c < firebase/firebase-config.js) bytes)"
+
+      - name: Materialize manifest.json
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const m = JSON.parse(fs.readFileSync('manifest.example.json', 'utf8'));
+            m.version = process.env.VERSION;
+            m.oauth2 = m.oauth2 || {};
+            m.oauth2.client_id = process.env.OAUTH_CLIENT_ID;
+            fs.writeFileSync('manifest.json', JSON.stringify(m, null, 2) + '\n');
+          "
+          echo "Wrote manifest.json (version=$VERSION)"
+
+      - name: Syntax-check JS
+        run: |
+          node --check background/service-worker.js
+          node --check popup/popup.js
+          node --check firebase/firestore.js
+          node --check firebase/firebase-config.js
+
+      - name: Stage extension files
+        run: |
+          STAGE="$RUNNER_TEMP/ext"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.idea' \
+            --exclude='.vscode' \
+            --exclude='*.example.*' \
+            --exclude='create_icons.py' \
+            --exclude='README.md' \
+            --exclude='.gitignore' \
+            --exclude='firestore.rules' \
+            --exclude='dist' \
+            ./ "$STAGE/"
+          echo "Staged contents:"
+          ls -la "$STAGE"
+
+      - name: Package zip
+        id: pkg
+        run: |
+          mkdir -p dist
+          NAME="shared-bookmarks-${{ steps.ver.outputs.version }}"
+          ZIP="$GITHUB_WORKSPACE/dist/${NAME}.zip"
+          (cd "$RUNNER_TEMP/ext" && zip -r "$ZIP" . -x "*.DS_Store")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP"   >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+

@@ -144,6 +144,56 @@ panel — so there's no UI flicker while sync runs.
 
 ---
 
+## Continuous Integration
+
+Every push and PR to `main` triggers
+[`.github/workflows/build.yml`](.github/workflows/build.yml), which:
+
+1. Computes a build version of the form `MAJOR.MINOR.<run_number>`
+   (the `MAJOR.MINOR` part is read from `manifest.example.json`).
+2. Materializes the two git-ignored files from repository secrets:
+   - `firebase/firebase-config.js` ← secret **`FIREBASE_CONFIG_JS`**
+   - `manifest.json` ← built from `manifest.example.json` with the version
+     stamped in and the OAuth client ID replaced from secret
+     **`OAUTH_CLIENT_ID`**.
+3. Syntax-checks all JS files.
+4. Packages the extension into `shared-bookmarks-<version>.zip` (excluding
+   `.git`, `.github`, `*.example.*`, `README.md`, `firestore.rules`,
+   `create_icons.py`, etc.).
+5. Uploads the zip as a workflow artifact (downloadable from the run page,
+   30-day retention).
+
+The popup shows the running version in the bottom-right corner via
+`chrome.runtime.getManifest().version`, so locally you'll see the version from
+your `manifest.json` and CI builds will show e.g. `v1.0.42`.
+
+### Required GitHub Secrets
+
+Create these under **Repo → Settings → Secrets and variables → Actions →
+New repository secret**:
+
+| Secret               | Value                                                                                  |
+| -------------------- | -------------------------------------------------------------------------------------- |
+| `FIREBASE_CONFIG_JS` | The full contents of your local `firebase/firebase-config.js` file (the entire ES module, exactly as it is on disk). |
+| `OAUTH_CLIENT_ID`    | Just the OAuth Chrome-extension client ID, e.g. `123456789012-abcdefghijklmnopqrstuvwx.apps.googleusercontent.com`. |
+
+Quick way to copy the firebase config into your clipboard (macOS):
+
+```bash
+pbcopy < firebase/firebase-config.js
+```
+
+Then paste it as the value of `FIREBASE_CONFIG_JS`.
+
+### Downloading a build
+
+1. Open the repo on GitHub → **Actions** tab.
+2. Pick the latest green run on `main`.
+3. Scroll to **Artifacts** → download `shared-bookmarks-<version>.zip`.
+4. Unzip it and load it in `chrome://extensions` via **Load unpacked**.
+
+---
+
 ## License
 
 MIT.

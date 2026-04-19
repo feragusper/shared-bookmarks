@@ -347,4 +347,11 @@ function escapeHtml(str) {
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+// Show extension version in the corner of the popup
+try {
+  const v = chrome.runtime.getManifest().version;
+  const el = document.getElementById("version-badge");
+  if (el) el.textContent = "v" + v;
+} catch (_) { /* noop */ }
+
 init();

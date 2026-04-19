@@ -838,139 +838,22 @@ input[type="text"]:focus {
   transform: translateX(-50%) translateY(0);
 }
 
-/* ── Folder hint ───────────────────────────────────────────────────────── */
-.folder-hint {
-  padding: 16px;
-  font-size: 12px;
-  color: var(--md-sys-color-on-surface-variant);
-  line-height: 1.5;
+/* ── Version badge ─────────────────────────────────────────────────────── */
+.version-badge {
+  position: fixed;
+  bottom: 4px;
+  right: 6px;
+  font-size: 10px;
+  font-weight: 500;
   letter-spacing: 0.4px;
-  background: var(--md-sys-color-surface);
+  color: var(--md-sys-color-on-surface-variant, #79747e);
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+  z-index: 50;
+  font-family: "Roboto", system-ui, sans-serif;
 }
-
-.folder-hint strong {
-  color: var(--md-sys-color-on-surface);
-  font-weight: 500;
-}
-
-/* ── Room Setup (compatibility) ────────────────────────────────────────── */
-.room-setup {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 24px;
-  padding: 32px 24px;
-  text-align: center;
-}
-
-.room-setup h2 {
-  font-family: var(--md-font-brand);
-  font-size: 24px;
-  font-weight: 500;
-  line-height: 1.2;
-  color: var(--md-sys-color-on-surface);
-}
-
-.room-setup h2 em {
-  font-style: normal;
-  color: var(--md-sys-color-primary);
-}
-
-.room-option {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-}
-
-/* Invite code (large display) */
-.invite-content {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  padding: 28px 24px;
-  text-align: center;
-}
-
-.invite-desc {
-  color: var(--md-sys-color-on-surface-variant);
-  font-size: 14px;
-  line-height: 1.5;
-  letter-spacing: 0.25px;
-}
-
-.invite-code {
-  font-family: var(--md-font-brand);
-  font-size: 36px;
-  font-weight: 500;
-  letter-spacing: 0.2em;
-  color: var(--md-sys-color-on-primary-container);
-  background: var(--md-sys-color-primary-container);
-  border: none;
-  padding: 18px 28px;
-  border-radius: var(--md-shape-lg);
-  user-select: all;
-}
-
-.invite-hint {
-  color: var(--md-sys-color-on-surface-variant);
-  font-size: 12px;
-  line-height: 1.5;
-  max-width: 260px;
-  letter-spacing: 0.4px;
-}
-
-/* ── Add bar (compatibility) ───────────────────────────────────────────── */
-.add-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
-  background: var(--md-sys-color-surface-container-low);
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
-}
-
-.add-bar-info {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.add-favicon {
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  flex-shrink: 0;
-}
-
-.add-bar-text { min-width: 0; flex: 1; }
-
-.add-title {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--md-sys-color-on-surface);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  letter-spacing: 0.1px;
-}
-
-.add-url {
-  font-size: 11px;
-  color: var(--md-sys-color-on-surface-variant);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  letter-spacing: 0.4px;
-}
+.version-badge:empty { display: none; }
 
 /* ── Focus ring ────────────────────────────────────────────────────────── */
 :focus-visible {
