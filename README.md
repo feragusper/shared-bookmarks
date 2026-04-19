@@ -11,6 +11,9 @@ seconds. Nested subfolders are supported.
 Backend is Firebase (Firestore + Google Auth) accessed directly via REST,
 so the extension ships with **no bundler and no Firebase SDK**.
 
+> 🤖 **AI agents:** see [`AGENTS.md`](./AGENTS.md) and
+> [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) before editing.
+
 ---
 
 ## Features
