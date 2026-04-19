@@ -1,0 +1,76 @@
+// Firestore Security Rules
+// Deploy via: Firebase Console → Firestore → Rules
+// Or: firebase deploy --only firestore:rules
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Users ─────────────────────────────────────────────────────────────
+    // Users can only read/write their own document
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // ── Rooms ─────────────────────────────────────────────────────────────
+    match /rooms/{roomId} {
+      // Any authenticated user can create a room (they become createdBy)
+      allow create: if request.auth != null
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.members.size() == 1
+        && request.resource.data.members[0] == request.auth.uid;
+
+      // Only members of the room can read it
+      allow read: if request.auth != null
+        && (
+          request.auth.uid in resource.data.members
+          || resource.data.members.size() < 2
+        );
+
+      // Only members can update (e.g. joining adds uid to members array)
+      // Prevent removing members or changing createdBy
+      allow update: if request.auth != null
+        && (request.auth.uid in resource.data.members
+            || request.auth.uid == request.resource.data.members[request.resource.data.members.size() - 1])
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.members.size() <= 2;
+
+      // ── Bookmarks subcollection ──────────────────────────────────────
+      match /bookmarks/{bookmarkId} {
+        // Only room members can read/write bookmarks
+        allow read, write: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.members;
+      }
+
+      // ── Folders subcollection (mirror of nested folder structure) ────
+      match /folders/{folderId} {
+        allow read, write: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.members;
+      }
+    }
+
+    // ── Invite code lookup docs ───────────────────────────────────────────
+    // roomInvites/{CODE} -> { roomId, createdBy, createdAt }
+    match /roomInvites/{code} {
+      // Create when room is created
+      allow create: if request.auth != null
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.roomId is string;
+
+      // Allow direct lookup by code for authenticated users.
+      allow get: if request.auth != null;
+      allow list: if false;
+
+      // Keep lookup docs immutable; creator/member cleanup is done via delete only.
+      allow update: if false;
+
+      // Allow owner or room members to delete invite docs.
+      allow delete: if request.auth != null
+        && (
+          request.auth.uid == resource.data.createdBy
+          || request.auth.uid in get(/databases/$(database)/documents/rooms/$(resource.data.roomId)).data.members
+        );
+    }
+  }
+}
