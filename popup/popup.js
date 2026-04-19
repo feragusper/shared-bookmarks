@@ -328,12 +328,22 @@ function renderMembers(room) {
 }
 
 // ─── Open Chrome Bookmarks Manager on the shared folder ─────────────────────
-document.getElementById("btn-open-manager").addEventListener("click", async () => {
+document.getElementById("btn-open-manager").addEventListener("click", () => {
+  openSharedFolderInChrome();
+});
+
+// ─── Manual "Sync now" button ───────────────────────────────────────────────
+document.getElementById("btn-sync-now").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-sync-now");
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Syncing…";
   try {
-    const folderId = await getOrCreateChromeFolder();
-    chrome.tabs.create({ url: `chrome://bookmarks/?id=${folderId}` });
-  } catch (_) {
-    chrome.tabs.create({ url: "chrome://bookmarks/" });
+    const resp = await requestSync();
+    toast(resp?.ok ? "✓ Synced" : "Sync queued");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
   }
 });
 
