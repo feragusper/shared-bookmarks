@@ -67,9 +67,13 @@ jobs:
       - name: Syntax-check JS
         run: |
           node --check background/service-worker.js
+          node --check background/sync-core.js
           node --check popup/popup.js
           node --check firebase/firestore.js
           node --check firebase/firebase-config.js
+
+      - name: Run unit tests
+        run: node --test 'test/*.test.js'
 
       - name: Stage extension files
         run: |
@@ -86,6 +90,15 @@ jobs:
             --exclude='.gitignore' \
             --exclude='firestore.rules' \
             --exclude='dist' \
+            --exclude='test' \
+            --exclude='scripts' \
+            --exclude='docs' \
+            --exclude='AGENTS.md' \
+            --exclude='CLAUDE.md' \
+            --exclude='package.json' \
+            --exclude='package-lock.json' \
+            --exclude='node_modules' \
+            --exclude='*.pem' \
             ./ "$STAGE/"
           echo "Staged contents:"
           ls -la "$STAGE"

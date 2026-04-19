@@ -1,0 +1,10 @@
+{
+  "name": "shared-bookmarks",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 extension that shares a bookmark folder between two users via Firestore.",
+  "scripts": {
+    "test": "node --test 'test/*.test.js'"
+  }
+}
+

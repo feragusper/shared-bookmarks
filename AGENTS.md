@@ -194,18 +194,35 @@ To bump major or minor, edit the `version` field in
 
 1. Make sure `manifest.json` and `firebase/firebase-config.js` exist
    (copy from the `*.example.*` files and fill them in).
-2. `chrome://extensions` → Developer mode → **Load unpacked** → pick the
+2. Run the unit tests for the pure sync core:
+   ```bash
+   node --test 'test/*.test.js'
+   ```
+   No `npm install` needed — there are zero dependencies. The runner
+   uses the built-in `node:test` module (Node 18+).
+3. `chrome://extensions` → Developer mode → **Load unpacked** → pick the
    repo root.
-3. After every code change, hit the reload icon on the extension card.
-4. Inspect the service worker via the **Service worker** link on the
+4. After every code change, hit the reload icon on the extension card.
+5. Inspect the service worker via the **Service worker** link on the
    extension card. `[SW]`-prefixed logs appear there.
-5. To validate JS without loading the extension:
+6. To validate JS without loading the extension:
    ```bash
    node --check background/service-worker.js
+   node --check background/sync-core.js
    node --check popup/popup.js
    node --check firebase/firestore.js
    node --check firebase/firebase-config.js
    ```
+
+### Adding tests
+
+- All tests live in `test/*.test.js` and use the standard `node:test` API
+  (`describe`, `it`, `assert`).
+- **Never add npm dependencies.** If you need a mock, hand-roll it in
+  `test/_*.js` (see `_chrome-mock.js` and `_fetch-mock.js`).
+- New behavior in `background/sync-core.js` MUST come with a test row
+  in `test/sync-core.test.js`. The pure module is the contract — the
+  shell must remain a thin adapter.
 
 ## 10. Past bugs / lessons learned
 

@@ -9,6 +9,13 @@ past-bug lessons live in [`AGENTS.md`](../AGENTS.md) at the repo root.
 - **Stack**: Chrome Extension MV3, plain ES2022 modules, no bundler, no
   Firebase SDK. All Firebase I/O is `fetch()` against REST endpoints in
   `firebase/firestore.js`.
+b vcx   - **Sync engine** lives in `background/`:
+  - `sync-core.js` is **pure** — no `chrome.*`, no `fetch`. All path
+    math, identity, dedup, diff and plan logic. **Add new sync behavior
+    here first**, with tests in `test/sync-core.test.js`.
+  - `service-worker.js` is the I/O shell that calls into `sync-core.js`.
+- **Tests** use only the built-in `node:test` runner. **Never add npm
+  deps** — `package.json` must stay dependency-free.
 - **Service worker** (`background/service-worker.js`) must be MV3-safe:
   no `setInterval`, no `window`/`document`. Periodic work uses
   `chrome.alarms`.
