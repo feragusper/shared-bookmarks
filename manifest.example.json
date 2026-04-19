@@ -37,6 +37,7 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA15ExjpNd7Mr+tj8ImkdcdpSgOQfbM8Eh3GM7R3/EaEllJpgcFf44D2NJjUvjmm7Ak1jZwfMnIbQHhDv9wIS34IS1XWgvBRuNmciZ9GY4EsepfbZN478YrSRpVU48jwean7zqxWn0LIusol8MS4pX2dQ8fgIGwvc++jD5kwY3pFSry+kQ/NqOy+fwBxHDtQ3IGjaf9PMHIf6sibwb2zni4e8RfKroyvnxiO1ds5Q89nI+G4A10sMToqWVpaQZtZOx3SpjkJgAuJBz725rKhYoc2DakW0ibtZzmtotUXFxnB9YxNSKB7QBeWbHV1i8iAWQNQ/GcdKaJKzLHNDZsFK3EwIDAQAB",
   "oauth2": {
     "client_id": "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com",
     "scopes": [

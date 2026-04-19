@@ -227,6 +227,10 @@ the user will be unhappy.
 - **Popup flicker on each poll.** Caused by re-rendering bookmarks in the
   popup. Solution: don't render bookmarks in the popup at all — the
   popup is membership-only.
+- **`bad client id` after loading from a different folder.** The OAuth
+  client is bound to the Extension ID, which Chrome derives from the
+  source-folder path unless `manifest.json` has a `"key"` field. We pin
+  the ID via `"key"`; do not remove it. See `scripts/generate-extension-key.sh`.
 
 ## 11. When in doubt
 

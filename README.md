@@ -197,6 +197,33 @@ Then paste it as the value of `FIREBASE_CONFIG_JS`.
 
 ---
 
+## Troubleshooting
+
+### `Sign-in failed: OAuth2 request failed: bad client id: …`
+
+The Chrome Extension OAuth client is bound to a specific Extension ID.
+Without a `"key"` field in `manifest.json`, Chrome derives the ID from
+the source-folder path, so loading from a different folder (or the CI
+zip) yields a different ID and OAuth rejects it.
+
+Fix:
+
+1. Run `./scripts/generate-extension-key.sh`.
+2. Paste the printed `"key"` value into both `manifest.json` and
+   `manifest.example.json` (already done if you cloned a recent main).
+3. Reload the extension at `chrome://extensions`. The card now shows
+   the new, stable Extension ID printed by the script.
+4. In Google Cloud Console → **APIs & Services → Credentials → your
+   Chrome Extension OAuth client → Application ID**, replace (or add)
+   the new Extension ID. Save.
+5. Click **Continue with Google** again.
+
+The same `"key"` value travels with the CI-built zip, so unzipping it
+elsewhere produces the same Extension ID and the same OAuth client
+keeps working.
+
+---
+
 ## License
 
 MIT.
