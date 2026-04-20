@@ -307,7 +307,10 @@ export async function listBookmarks(roomId, idToken) {
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${idToken}` }
   });
-  if (!resp.ok) throw new Error("Failed to list bookmarks");
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Failed to list bookmarks (${resp.status}): ${body}`);
+  }
   const data = await resp.json();
   if (!data.documents) return [];
   return data.documents.map(docToObject).filter(Boolean);
@@ -336,7 +339,10 @@ export async function listFolders(roomId, idToken) {
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${idToken}` }
   });
-  if (!resp.ok) throw new Error("Failed to list folders");
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Failed to list folders (${resp.status}): ${body}`);
+  }
   const data = await resp.json();
   if (!data.documents) return [];
   return data.documents.map(docToObject).filter(Boolean);

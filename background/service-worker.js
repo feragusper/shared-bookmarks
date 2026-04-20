@@ -220,7 +220,8 @@ async function parentPathOfNode(parentId) {
 
 function isAuthError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
-  return msg.includes("401") || msg.includes("unauthenticated") ||
+  return msg.includes("401") || msg.includes("403") ||
+         msg.includes("unauthenticated") || msg.includes("permission_denied") ||
          msg.includes("invalid_token") || msg.includes("expired") ||
          msg.includes("invalid id token");
 }
