@@ -76,7 +76,21 @@ async function init() {
   if (stored.roomId) {
     state.room = { roomId: stored.roomId };
   } else {
-    await autoCreateRoom();
+    // Defense in depth: never blindly auto-create a room from init() — that's
+    // how a transient hiccup could orphan the user from their existing shared
+    // folder. First try to restore sharedRoomId from the user's Firestore doc.
+    try {
+      const userDoc = await getUser(state.user.uid, state.user.idToken);
+      if (userDoc?.sharedRoomId) {
+        state.room = { roomId: userDoc.sharedRoomId };
+        await chrome.storage.local.set({ roomId: userDoc.sharedRoomId });
+      } else {
+        await autoCreateRoom();
+      }
+    } catch (err) {
+      console.warn("[popup] could not restore room from Firestore:", err);
+      // Don't auto-create on network failure — leave it for the user to retry.
+    }
   }
 
   await enterMainScreen();
@@ -271,15 +285,14 @@ document.getElementById("btn-open-manager").addEventListener("click", () => {
 // ─── Manual "Sync now" button ───────────────────────────────────────────────
 document.getElementById("btn-sync-now").addEventListener("click", async () => {
   const btn = document.getElementById("btn-sync-now");
-  const original = btn.textContent;
   btn.disabled = true;
-  btn.textContent = "Syncing…";
+  btn.classList.add("syncing");
   try {
     const resp = await requestSync();
     toast(resp?.ok ? "✓ Synced" : "Sync queued");
   } finally {
     btn.disabled = false;
-    btn.textContent = original;
+    btn.classList.remove("syncing");
   }
 });
 

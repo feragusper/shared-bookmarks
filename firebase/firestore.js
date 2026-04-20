@@ -143,13 +143,16 @@ async function firestoreRequest(method, path, body, idToken) {
 
 export async function upsertUser(uid, data, idToken) {
   const fields = {};
-  for (const [k, v] of Object.entries(data)) fields[k] = firestoreValue(v);
-  await firestoreRequest(
-    "PATCH",
-    `users/${uid}`,
-    { fields },
-    idToken
-  );
+  const maskParts = [];
+  for (const [k, v] of Object.entries(data)) {
+    fields[k] = firestoreValue(v);
+    maskParts.push(`updateMask.fieldPaths=${encodeURIComponent(k)}`);
+  }
+  // IMPORTANT: without updateMask, Firestore REST PATCH replaces the entire
+  // document and silently wipes fields we didn't mention (e.g. sharedRoomId).
+  // That used to disconnect users from their shared room on every login.
+  const path = `users/${uid}?${maskParts.join("&")}`;
+  await firestoreRequest("PATCH", path, { fields }, idToken);
 }
 
 export async function getUser(uid, idToken) {
