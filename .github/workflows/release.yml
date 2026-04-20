@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write   # required to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Compute version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$TAG" = "$GITHUB_REF" ] || [ -z "$TAG" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::Could not determine tag"
+            exit 1
+          fi
+          # Strip leading 'v'
+          VERSION="${TAG#v}"
+          # Validate semver-ish
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$TAG' does not look like a release tag (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (manifest version=$VERSION)"
+
+      - name: Validate required secrets
+        env:
+          FIREBASE_CONFIG_JS: ${{ secrets.FIREBASE_CONFIG_JS }}
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+        run: |
+          missing=0
+          [ -z "$FIREBASE_CONFIG_JS" ] && { echo "::error::Missing FIREBASE_CONFIG_JS"; missing=1; }
+          [ -z "$OAUTH_CLIENT_ID" ] && { echo "::error::Missing OAUTH_CLIENT_ID"; missing=1; }
+          [ "$missing" = "1" ] && exit 1
+          true
+
+      - name: Materialize firebase/firebase-config.js
+        env:
+          FIREBASE_CONFIG_JS: ${{ secrets.FIREBASE_CONFIG_JS }}
+        run: |
+          printf '%s\n' "$FIREBASE_CONFIG_JS" > firebase/firebase-config.js
+
+      - name: Materialize manifest.json
+        env:
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const m = JSON.parse(fs.readFileSync('manifest.example.json', 'utf8'));
+            m.version = process.env.VERSION;
+            m.oauth2 = m.oauth2 || {};
+            m.oauth2.client_id = process.env.OAUTH_CLIENT_ID;
+            fs.writeFileSync('manifest.json', JSON.stringify(m, null, 2) + '\n');
+          "
+
+      - name: Syntax-check JS
+        run: |
+          node --check background/service-worker.js
+          node --check background/sync-core.js
+          node --check popup/popup.js
+          node --check firebase/firestore.js
+          node --check firebase/firebase-config.js
+
+      - name: Sanity-check service worker is not truncated
+        run: |
+          for sym in \
+              "chrome.alarms.onAlarm.addListener" \
+              "chrome.bookmarks.onCreated.addListener" \
+              "chrome.bookmarks.onRemoved.addListener" \
+              "chrome.runtime.onMessage.addListener" \
+              "pullAndReconcile"; do
+            if ! grep -q "$sym" background/service-worker.js; then
+              echo "::error::service-worker.js missing required symbol: $sym"
+              exit 1
+            fi
+          done
+          [ "$(wc -l < background/service-worker.js)" -ge 200 ] || {
+            echo "::error::service-worker.js is suspiciously short"; exit 1; }
+
+      - name: Run unit tests
+        run: node --test test/*.test.js
+
+      - name: Stage extension files
+        run: |
+          STAGE="$RUNNER_TEMP/ext"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.idea' \
+            --exclude='.vscode' \
+            --exclude='*.example.*' \
+            --exclude='create_icons.py' \
+            --exclude='README.md' \
+            --exclude='.gitignore' \
+            --exclude='firestore.rules' \
+            --exclude='dist' \
+            --exclude='test' \
+            --exclude='scripts' \
+            --exclude='docs' \
+            --exclude='AGENTS.md' \
+            --exclude='CLAUDE.md' \
+            --exclude='package.json' \
+            --exclude='package-lock.json' \
+            --exclude='node_modules' \
+            --exclude='*.pem' \
+            ./ "$STAGE/"
+
+      - name: Package zip
+        id: pkg
+        run: |
+          mkdir -p dist
+          NAME="shared-bookmarks-${{ steps.ver.outputs.version }}"
+          ZIP="$GITHUB_WORKSPACE/dist/${NAME}.zip"
+          (cd "$RUNNER_TEMP/ext" && zip -r "$ZIP" . -x "*.DS_Store")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "zip=$ZIP"   >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Resolve release notes body
+        id: notes
+        run: |
+          FILE="docs/release-notes/${{ steps.ver.outputs.tag }}.md"
+          if [ -f "$FILE" ]; then
+            echo "Using curated notes from $FILE"
+            echo "body_path=$FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "No curated notes file, falling back to GitHub auto-generated"
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
+          files: dist/*.zip
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+

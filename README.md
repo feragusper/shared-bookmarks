@@ -195,6 +195,38 @@ Then paste it as the value of `FIREBASE_CONFIG_JS`.
 3. Scroll to **Artifacts** → download `shared-bookmarks-<version>.zip`.
 4. Unzip it and load it in `chrome://extensions` via **Load unpacked**.
 
+## Releases
+
+Tagged releases are published via
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+Pushing a `vMAJOR.MINOR.PATCH` tag (e.g. `v1.0.0`) triggers the workflow,
+which:
+
+1. Builds the extension using the tag (minus the leading `v`) as the
+   `manifest.json` version.
+2. Runs the same syntax-check / SW sanity-check / unit-test gates as
+   `build.yml`.
+3. Packages `shared-bookmarks-<version>.zip`.
+4. Creates (or updates) a GitHub Release named after the tag, attaches
+   the zip as a release asset, and uses `docs/release-notes/<tag>.md`
+   as the body if it exists; otherwise falls back to GitHub's
+   auto-generated notes.
+
+To cut a release locally:
+
+```bash
+# 1. Make sure main is green and you're on the commit you want to ship.
+git tag -a v1.2.3 -m "Release v1.2.3"
+git push origin v1.2.3
+
+# 2. (optional) Pre-write curated notes:
+#    docs/release-notes/v1.2.3.md
+```
+
+The release will appear at
+`https://github.com/<owner>/shared-bookmarks/releases/tag/v1.2.3`
+within a minute, with `shared-bookmarks-1.2.3.zip` attached.
+
 ---
 
 ## Troubleshooting
