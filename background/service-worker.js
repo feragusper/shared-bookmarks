@@ -35,9 +35,13 @@ import {
 
 const CHROME_FOLDER_NAME = "Shared Bookmark Folder";
 const POLL_ALARM = "shared-bookmarks-poll";
-const POLL_PERIOD_MIN = 0.5;          // 30 s
+const POLL_PERIOD_MIN = 2;            // 2 min — keeps us well within Spark free tier
 const RECONCILE_LOCK_TTL_MS = 30_000; // 30 s — short enough that crashed runs auto-recover
 const ECHO_TTL_MS = 60_000;
+
+// ─── Backoff state (resets on successful poll) ──────────────────────────────
+let consecutiveFailures = 0;
+const MAX_BACKOFF_SKIPS = 5;          // at max: skip 5 alarms → ~10 min between retries
 
 console.log("[SW] service-worker.js loaded at", new Date().toISOString());
 
@@ -70,10 +74,22 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) {
+    // Exponential backoff: skip alarms when we've had consecutive failures
+    if (consecutiveFailures > 0) {
+      const skipsNeeded = Math.min(consecutiveFailures, MAX_BACKOFF_SKIPS);
+      // Use a simple counter stored on the function
+      backoffCounter = (backoffCounter || 0) + 1;
+      if (backoffCounter < skipsNeeded) {
+        console.log(`[SW] alarm fired — backing off (${backoffCounter}/${skipsNeeded})`);
+        return;
+      }
+      backoffCounter = 0;
+    }
     console.log("[SW] alarm fired");
     pullAndReconcile().catch(err => console.warn("[SW] poll error:", err));
   }
 });
+let backoffCounter = 0;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_CURRENT_TAB") {
@@ -220,6 +236,7 @@ async function parentPathOfNode(parentId) {
 
 function isAuthError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
+  if (msg.includes("429") || msg.includes("resource_exhausted")) return false;
   return msg.includes("401") || msg.includes("403") ||
          msg.includes("unauthenticated") || msg.includes("permission_denied") ||
          msg.includes("invalid_token") || msg.includes("expired") ||
@@ -366,11 +383,18 @@ async function runOneReconcileIteration() {
       ]);
     });
   } catch (err) {
-    console.warn("[SW] failed to fetch remote state:", err);
+    const msg = String(err?.message || "");
+    if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
+      consecutiveFailures++;
+      console.warn(`[SW] rate limited (429) — backoff level ${consecutiveFailures}`);
+    } else {
+      console.warn("[SW] failed to fetch remote state:", err);
+    }
     return;
   }
 
-  const subtree = await getSubTree(sharedId);
+  // Success — reset backoff
+  consecutiveFailures = 0;  const subtree = await getSubTree(sharedId);
   const { folders: localFolders, bookmarks: localBookmarks } = walkTreeToEntities(subtree);
 
   const stored = await chrome.storage.local.get([
