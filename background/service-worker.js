@@ -3,11 +3,13 @@
 //
 // Responsibilities:
 //   - listen to chrome.bookmarks.* events and push deltas to Firestore
-//   - poll Firestore via chrome.alarms and reconcile the local tree
+//   - reconcile on install, startup, room change, and manual FORCE_SYNC
 //   - persist bookkeeping state (lastSynced sets, lock, recently-applied)
 //   - suppress echoes between local creates triggered by reconcile and the
 //     onCreated listener that fires for them
 //   - refresh the Firebase ID token transparently on 401
+//   - NO periodic polling — all sync is event-driven to stay within
+//     Firestore free-tier quotas
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
@@ -34,62 +36,22 @@ import {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const CHROME_FOLDER_NAME = "Shared Bookmark Folder";
-const POLL_ALARM = "shared-bookmarks-poll";
-const POLL_PERIOD_MIN = 2;            // 2 min — keeps us well within Spark free tier
 const RECONCILE_LOCK_TTL_MS = 30_000; // 30 s — short enough that crashed runs auto-recover
 const ECHO_TTL_MS = 60_000;
 
-// ─── Backoff state (resets on successful poll) ──────────────────────────────
-let consecutiveFailures = 0;
-const MAX_BACKOFF_SKIPS = 5;          // at max: skip 5 alarms → ~10 min between retries
-
 console.log("[SW] service-worker.js loaded at", new Date().toISOString());
 
-// ─── Alarm registration (idempotent, runs on every SW wake) ────────────────
-
-function ensurePollAlarm() {
-  // chrome.alarms.create is fully synchronous and idempotent: re-creating
-  // with the same name replaces the previous one. Safe to call on every wake.
-  chrome.alarms.create(POLL_ALARM, {
-    periodInMinutes: POLL_PERIOD_MIN,
-    delayInMinutes: 0.1
-  });
-  console.log("[SW] alarm scheduled, period=", POLL_PERIOD_MIN, "min");
-}
-
-// IMPORTANT: call at top level so the alarm is guaranteed to exist on every
-// SW wake, not only on install/startup events (which can be missed).
-ensurePollAlarm();
+// ─── Lifecycle events — reconcile once on install/startup ───────────────────
 
 chrome.runtime.onInstalled.addListener((details) => {
   console.log("[SW] onInstalled:", details.reason);
-  ensurePollAlarm();
   pullAndReconcile().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
   console.log("[SW] onStartup");
-  ensurePollAlarm();
+  pullAndReconcile().catch(() => {});
 });
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === POLL_ALARM) {
-    // Exponential backoff: skip alarms when we've had consecutive failures
-    if (consecutiveFailures > 0) {
-      const skipsNeeded = Math.min(consecutiveFailures, MAX_BACKOFF_SKIPS);
-      // Use a simple counter stored on the function
-      backoffCounter = (backoffCounter || 0) + 1;
-      if (backoffCounter < skipsNeeded) {
-        console.log(`[SW] alarm fired — backing off (${backoffCounter}/${skipsNeeded})`);
-        return;
-      }
-      backoffCounter = 0;
-    }
-    console.log("[SW] alarm fired");
-    pullAndReconcile().catch(err => console.warn("[SW] poll error:", err));
-  }
-});
-let backoffCounter = 0;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_CURRENT_TAB") {
@@ -105,13 +67,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "FORCE_SYNC") {
     console.log("[SW] FORCE_SYNC requested");
-    // Clear any stale lock first so manual sync always runs.
     chrome.storage.local.remove("reconcileLock")
       .then(() => pullAndReconcile())
       .then(() => sendResponse({ ok: true }))
       .catch((err) => {
-        console.warn("[SW] FORCE_SYNC failed:", err);
-        sendResponse({ ok: false, error: String(err?.message || err) });
+        const errMsg = formatSyncError(err);
+        console.warn("[SW] FORCE_SYNC failed:", errMsg);
+        sendResponse({ ok: false, error: errMsg });
       });
     return true;
   }
@@ -124,7 +86,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
   if (changes.user || changes.roomId) {
-    ensurePollAlarm();
     if (changes.roomId) {
       console.log("[SW] roomId changed, switching to seed mode");
       await chrome.storage.local.set({
@@ -234,13 +195,36 @@ async function parentPathOfNode(parentId) {
 
 // ─── Token refresh ──────────────────────────────────────────────────────────
 
+// ─── Error classification ───────────────────────────────────────────────────
+
+function isQuotaError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("429") || msg.includes("resource_exhausted") || msg.includes("quota");
+}
+
 function isAuthError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
-  if (msg.includes("429") || msg.includes("resource_exhausted")) return false;
+  if (isQuotaError(err)) return false;
   return msg.includes("401") || msg.includes("403") ||
          msg.includes("unauthenticated") || msg.includes("permission_denied") ||
          msg.includes("invalid_token") || msg.includes("expired") ||
          msg.includes("invalid id token");
+}
+
+/**
+ * Turn a raw Error into a short, user-facing message.
+ * The popup can show this directly in a toast.
+ */
+function formatSyncError(err) {
+  if (isQuotaError(err)) {
+    return "Firebase quota exceeded — daily free-tier limit reached. " +
+           "Sync will resume automatically when the quota resets (midnight US/Pacific). " +
+           "Consider upgrading to the Blaze plan in the Firebase console.";
+  }
+  if (isAuthError(err)) {
+    return "Authentication expired. Please sign out and sign back in.";
+  }
+  return String(err?.message || err || "Unknown sync error");
 }
 
 async function refreshUserToken() {
@@ -383,18 +367,18 @@ async function runOneReconcileIteration() {
       ]);
     });
   } catch (err) {
-    const msg = String(err?.message || "");
-    if (msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
-      consecutiveFailures++;
-      console.warn(`[SW] rate limited (429) — backoff level ${consecutiveFailures}`);
-    } else {
-      console.warn("[SW] failed to fetch remote state:", err);
+    const friendly = formatSyncError(err);
+    console.warn("[SW] failed to fetch remote state:", friendly);
+    if (isQuotaError(err)) {
+      // Store the error so the popup can show it
+      await chrome.storage.local.set({ lastSyncError: friendly });
+      throw err;  // propagate so FORCE_SYNC can surface it
     }
     return;
   }
 
-  // Success — reset backoff
-  consecutiveFailures = 0;  const subtree = await getSubTree(sharedId);
+  // Clear any previous sync error on success
+  await chrome.storage.local.remove("lastSyncError");  const subtree = await getSubTree(sharedId);
   const { folders: localFolders, bookmarks: localBookmarks } = walkTreeToEntities(subtree);
 
   const stored = await chrome.storage.local.get([
@@ -547,7 +531,7 @@ async function pushBookmarkAdd(parentPath, node) {
     const set = new Set(lastSyncedKeys);
     set.add(key);
     await chrome.storage.local.set({ lastSyncedKeys: [...set] });
-  } catch (e) { console.warn("[SW] pushBookmarkAdd failed:", e); }
+  } catch (e) { console.warn("[SW] pushBookmarkAdd failed:", formatSyncError(e)); }
 }
 
 async function pushFolderAdd(folderPath, node) {
@@ -568,7 +552,7 @@ async function pushFolderAdd(folderPath, node) {
     const set = new Set(lastSyncedFolderPaths);
     set.add(folderPath);
     await chrome.storage.local.set({ lastSyncedFolderPaths: [...set] });
-  } catch (e) { console.warn("[SW] pushFolderAdd failed:", e); }
+  } catch (e) { console.warn("[SW] pushFolderAdd failed:", formatSyncError(e)); }
 }
 
 async function pushBookmarkDelete(parentPath, node) {
@@ -587,7 +571,7 @@ async function pushBookmarkDelete(parentPath, node) {
     const set = new Set(lastSyncedKeys);
     set.delete(key);
     await chrome.storage.local.set({ lastSyncedKeys: [...set] });
-  } catch (e) { console.warn("[SW] pushBookmarkDelete failed:", e); }
+  } catch (e) { console.warn("[SW] pushBookmarkDelete failed:", formatSyncError(e)); }
 }
 
 async function pushFolderDelete(folderPath) {
@@ -617,7 +601,7 @@ async function pushFolderDelete(folderPath) {
       lastSyncedKeys: [...keySet],
       lastSyncedFolderPaths: [...folderSet]
     });
-  } catch (e) { console.warn("[SW] pushFolderDelete failed:", e); }
+  } catch (e) { console.warn("[SW] pushFolderDelete failed:", formatSyncError(e)); }
 }
 
 // ─── Bookmark event listeners ───────────────────────────────────────────────

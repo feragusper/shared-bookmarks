@@ -25,12 +25,14 @@ function showScreen(id) {
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
 let toastTimer;
-function toast(msg) {
+function toast(msg, durationMs = 2500) {
   const el = document.getElementById("toast");
   el.textContent = msg;
   el.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 2500);
+  // Longer display for error messages
+  const dur = msg.length > 60 ? Math.max(durationMs, 5000) : durationMs;
+  toastTimer = setTimeout(() => el.classList.remove("show"), dur);
 }
 
 // ─── Talk to the service worker ──────────────────────────────────────────────
@@ -224,9 +226,13 @@ async function enterMainScreen() {
   if (!state.room?.roomId) return;
 
   await refreshRoomInfo();
-  // Ask the SW to sync once on popup open. The SW also polls every ~30s in
-  // the background via chrome.alarms, so this is just for instant feedback.
+  // Ask the SW to sync once on popup open (no background polling — sync is
+  // event-driven, so this manual pull catches partner changes).
   requestSync();
+
+  // Check for stored sync errors (e.g. quota exceeded)
+  const { lastSyncError } = await chrome.storage.local.get("lastSyncError");
+  if (lastSyncError) toast(lastSyncError);
 
   // Soft refresh of members every 8s while popup is open.
   clearInterval(state.membersTimer);
@@ -289,7 +295,13 @@ document.getElementById("btn-sync-now").addEventListener("click", async () => {
   btn.classList.add("syncing");
   try {
     const resp = await requestSync();
-    toast(resp?.ok ? "✓ Synced" : "Sync queued");
+    if (resp?.ok) {
+      toast("✓ Synced");
+    } else if (resp?.error) {
+      toast(resp.error);
+    } else {
+      toast("Sync queued");
+    }
   } finally {
     btn.disabled = false;
     btn.classList.remove("syncing");
