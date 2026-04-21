@@ -256,7 +256,14 @@ async function isEchoNode(nodeId) {
   }
   const { echoNodes = {} } = await chrome.storage.local.get("echoNodes");
   const t = echoNodes[nodeId];
-  return typeof t === "number" && Date.now() - t < ECHO_TTL_MS;
+  if (typeof t === "number" && Date.now() - t < ECHO_TTL_MS) {
+    // Consume the entry so subsequent events (e.g. user-initiated delete
+    // of a node that was created by pull) are NOT suppressed.
+    delete echoNodes[nodeId];
+    await chrome.storage.local.set({ echoNodes });
+    return true;
+  }
+  return false;
 }
 
 // ─── Lock ───────────────────────────────────────────────────────────────────
