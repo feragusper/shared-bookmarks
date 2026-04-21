@@ -348,6 +348,98 @@ export async function listFolders(roomId, idToken) {
   return data.documents.map(docToObject).filter(Boolean);
 }
 
+// ─── OPS (operation log for sync) ─────────────────────────────────────────────
+
+/**
+ * Write a sync operation to the oplog.
+ * @param {string} roomId
+ * @param {{ type: string, payload: object, author: string }} op
+ * @param {string} idToken
+ * @returns {string} the created op doc ID
+ */
+export async function writeOp(roomId, op, idToken) {
+  const fields = {};
+  const data = {
+    type: op.type,
+    payload: op.payload || {},
+    author: op.author,
+    createdAt: new Date(),
+    appliedBy: null
+  };
+  for (const [k, v] of Object.entries(data)) fields[k] = firestoreValue(v);
+  const doc = await firestoreRequest("POST", `rooms/${roomId}/ops`, { fields }, idToken);
+  return doc.name.split("/").pop();
+}
+
+/**
+ * List pending ops for the current user to apply (written by partner, not yet applied).
+ * Uses a structured query: author != myUid AND appliedBy == null, ordered by createdAt.
+ */
+export async function listPendingOps(roomId, myUid, idToken) {
+  const projectId = firebaseConfig.projectId;
+  const parent = `projects/${projectId}/databases/(default)/documents/rooms/${roomId}`;
+  const url = `https://firestore.googleapis.com/v1/${parent}/ops?orderBy=createdAt%20asc&pageSize=200`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${idToken}` }
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Failed to list ops (${resp.status}): ${body}`);
+  }
+  const data = await resp.json();
+  if (!data.documents) return [];
+  return data.documents
+    .map(docToObject)
+    .filter(Boolean)
+    .filter(op => op.author !== myUid && op.appliedBy === null);
+}
+
+/**
+ * Mark an op as applied by the current user.
+ */
+export async function markOpApplied(roomId, opId, myUid, idToken) {
+  const fields = {
+    appliedBy: firestoreValue(myUid)
+  };
+  await firestoreRequest(
+    "PATCH",
+    `rooms/${roomId}/ops/${opId}?updateMask.fieldPaths=appliedBy`,
+    { fields },
+    idToken
+  );
+}
+
+/**
+ * Delete all ops that have been applied (appliedBy != null).
+ * Also deletes ops older than 7 days as a safety net.
+ */
+export async function deleteAppliedOps(roomId, idToken) {
+  const projectId = firebaseConfig.projectId;
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${roomId}/ops?pageSize=200`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${idToken}` }
+  });
+  if (!resp.ok) return; // best-effort cleanup
+  const data = await resp.json();
+  if (!data.documents) return;
+
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const toDelete = data.documents
+    .map(docToObject)
+    .filter(Boolean)
+    .filter(op => {
+      if (op.appliedBy !== null) return true;
+      if (op.createdAt && +new Date(op.createdAt) < sevenDaysAgo) return true;
+      return false;
+    });
+
+  for (const op of toDelete) {
+    try {
+      await firestoreRequest("DELETE", `rooms/${roomId}/ops/${op._id}`, null, idToken);
+    } catch (_) { /* best-effort */ }
+  }
+}
+
 // ─── REAL-TIME LISTENER (Firestore Listen API) ────────────────────────────────
 
 /**

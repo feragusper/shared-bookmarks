@@ -1,15 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // service-worker.js — MV3 I/O shell over background/sync-core.js
 //
-// Responsibilities:
-//   - listen to chrome.bookmarks.* events and push deltas to Firestore
-//   - reconcile on install, startup, room change, and manual FORCE_SYNC
-//   - persist bookkeeping state (lastSynced sets, lock, recently-applied)
-//   - suppress echoes between local creates triggered by reconcile and the
-//     onCreated listener that fires for them
-//   - refresh the Firebase ID token transparently on 401
-//   - NO periodic polling — all sync is event-driven to stay within
-//     Firestore free-tier quotas
+// Oplog-based sync engine:
+//   - On local bookmark events: write ops to Firestore + update tree-state
+//   - On pull (FORCE_SYNC / popup open / startup): read partner's pending ops,
+//     apply them locally, mark as applied, cleanup
+//   - NO polling — all sync is event-driven
+//   - Echo suppression by Chrome node ID only
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
@@ -19,14 +16,17 @@ import {
   addFolder,
   deleteFolder,
   listFolders,
+  writeOp,
+  listPendingOps,
+  markOpApplied,
+  deleteAppliedOps,
   refreshIdToken
 } from "../firebase/firestore.js";
 
 import {
   walkTreeToEntities,
-  planReconcile,
-  bookmarkKey,
-  folderKey,
+  localEventToOps,
+  planOpApplication,
   joinSegments,
   encodeSegment,
   splitPath,
@@ -36,39 +36,35 @@ import {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const CHROME_FOLDER_NAME = "Shared Bookmark Folder";
-const RECONCILE_LOCK_TTL_MS = 30_000; // 30 s — short enough that crashed runs auto-recover
+const RECONCILE_LOCK_TTL_MS = 30_000;
 const ECHO_TTL_MS = 60_000;
 
 console.log("[SW] service-worker.js loaded at", new Date().toISOString());
 
-// ─── Lifecycle events — reconcile once on install/startup ───────────────────
+// ─── Lifecycle events ───────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener((details) => {
   console.log("[SW] onInstalled:", details.reason);
-  pullAndReconcile().catch(() => {});
+  pullAndApplyOps().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
   console.log("[SW] onStartup");
-  pullAndReconcile().catch(() => {});
+  pullAndApplyOps().catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GET_CURRENT_TAB") {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs[0];
-      sendResponse({
-        url: tab?.url || "",
-        title: tab?.title || "",
-        favicon: tab?.favIconUrl || ""
-      });
+      sendResponse({ url: tab?.url || "", title: tab?.title || "", favicon: tab?.favIconUrl || "" });
     });
     return true;
   }
   if (message?.type === "FORCE_SYNC") {
     console.log("[SW] FORCE_SYNC requested");
     chrome.storage.local.remove("reconcileLock")
-      .then(() => pullAndReconcile())
+      .then(() => pullAndApplyOps())
       .then(() => sendResponse({ ok: true }))
       .catch((err) => {
         const errMsg = formatSyncError(err);
@@ -87,14 +83,9 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
   if (area !== "local") return;
   if (changes.user || changes.roomId) {
     if (changes.roomId) {
-      console.log("[SW] roomId changed, switching to seed mode");
-      await chrome.storage.local.set({
-        lastSyncedKeys: [],
-        lastSyncedFolderPaths: [],
-        seedFromRemote: true
-      });
+      console.log("[SW] roomId changed, will seed on next sync");
     }
-    pullAndReconcile().catch(() => {});
+    pullAndApplyOps().catch(() => {});
   }
 });
 
@@ -193,8 +184,6 @@ async function parentPathOfNode(parentId) {
   return pathOfNode(parentId);
 }
 
-// ─── Token refresh ──────────────────────────────────────────────────────────
-
 // ─── Error classification ───────────────────────────────────────────────────
 
 function isQuotaError(err) {
@@ -211,21 +200,18 @@ function isAuthError(err) {
          msg.includes("invalid id token");
 }
 
-/**
- * Turn a raw Error into a short, user-facing message.
- * The popup can show this directly in a toast.
- */
 function formatSyncError(err) {
   if (isQuotaError(err)) {
     return "Firebase quota exceeded — daily free-tier limit reached. " +
-           "Sync will resume automatically when the quota resets (midnight US/Pacific). " +
-           "Consider upgrading to the Blaze plan in the Firebase console.";
+           "Sync will resume when the quota resets (midnight US/Pacific).";
   }
   if (isAuthError(err)) {
     return "Authentication expired. Please sign out and sign back in.";
   }
   return String(err?.message || err || "Unknown sync error");
 }
+
+// ─── Token refresh ──────────────────────────────────────────────────────────
 
 async function refreshUserToken() {
   const { user } = await chrome.storage.local.get("user");
@@ -237,7 +223,6 @@ async function refreshUserToken() {
   return newUser;
 }
 
-/** Execute fn(user) with current token; on auth failure, refresh and retry once. */
 async function withAuth(fn) {
   let { user } = await chrome.storage.local.get("user");
   if (!user?.idToken) throw new Error("Not authenticated");
@@ -250,33 +235,31 @@ async function withAuth(fn) {
   }
 }
 
-// ─── Echo suppression ───────────────────────────────────────────────────────
+// ─── Echo suppression (by Chrome node ID only) ─────────────────────────────
 
-const inMemoryRecentlyApplied = new Set();
+const echoNodeIds = new Set();
 
-async function markEcho(key) {
+async function markEchoNode(nodeId) {
+  echoNodeIds.add(nodeId);
+  // Also persist for cross-wake survival
   const now = Date.now();
-  const { recentlyApplied = {} } = await chrome.storage.local.get("recentlyApplied");
-  const pruned = pruneExpired(recentlyApplied, now, ECHO_TTL_MS);
-  pruned[key] = now;
-  await chrome.storage.local.set({ recentlyApplied: pruned });
-}
-
-async function isEcho(key) {
-  const { recentlyApplied = {} } = await chrome.storage.local.get("recentlyApplied");
-  const t = recentlyApplied[key];
-  return typeof t === "number" && Date.now() - t < ECHO_TTL_MS;
+  const { echoNodes = {} } = await chrome.storage.local.get("echoNodes");
+  const pruned = pruneExpired(echoNodes, now, ECHO_TTL_MS);
+  pruned[nodeId] = now;
+  await chrome.storage.local.set({ echoNodes: pruned });
 }
 
 async function isEchoNode(nodeId) {
-  if (inMemoryRecentlyApplied.has(nodeId)) {
-    inMemoryRecentlyApplied.delete(nodeId);
+  if (echoNodeIds.has(nodeId)) {
+    echoNodeIds.delete(nodeId);
     return true;
   }
-  return isEcho(`node:${nodeId}`);
+  const { echoNodes = {} } = await chrome.storage.local.get("echoNodes");
+  const t = echoNodes[nodeId];
+  return typeof t === "number" && Date.now() - t < ECHO_TTL_MS;
 }
 
-// ─── Reconcile lock ─────────────────────────────────────────────────────────
+// ─── Lock ───────────────────────────────────────────────────────────────────
 
 async function tryAcquireLock() {
   const now = Date.now();
@@ -285,41 +268,13 @@ async function tryAcquireLock() {
   await chrome.storage.local.set({ reconcileLock: now });
   return true;
 }
+
 async function releaseLock() { await chrome.storage.local.remove("reconcileLock"); }
+
 async function isLocked() {
   const now = Date.now();
   const { reconcileLock = 0 } = await chrome.storage.local.get("reconcileLock");
   return reconcileLock && now - reconcileLock < RECONCILE_LOCK_TTL_MS;
-}
-async function setDirty() { await chrome.storage.local.set({ reconcileDirty: true }); }
-async function consumeDirty() {
-  const { reconcileDirty } = await chrome.storage.local.get("reconcileDirty");
-  if (reconcileDirty) {
-    await chrome.storage.local.remove("reconcileDirty");
-    return true;
-  }
-  return false;
-}
-
-// ─── Pending local deletes (survive push failures) ──────────────────────────
-// Recorded IMMEDIATELY in onRemoved before any Firestore call, so that even
-// if the push fails (quota, network), the next reconcile knows the user
-// intentionally deleted this item and won't recreate it locally.
-
-async function addPendingDelete(type, key) {
-  const field = type === "folder" ? "pendingFolderDeletes" : "pendingBookmarkDeletes";
-  const stored = await chrome.storage.local.get(field);
-  const set = new Set(stored[field] || []);
-  set.add(key);
-  await chrome.storage.local.set({ [field]: [...set] });
-}
-
-async function removePendingDelete(type, key) {
-  const field = type === "folder" ? "pendingFolderDeletes" : "pendingBookmarkDeletes";
-  const stored = await chrome.storage.local.get(field);
-  const set = new Set(stored[field] || []);
-  set.delete(key);
-  await chrome.storage.local.set({ [field]: [...set] });
 }
 
 // ─── Local folder ensure path ───────────────────────────────────────────────
@@ -336,304 +291,168 @@ async function ensureLocalFolderPath(pathStr) {
     let match = kids.find(k => !k.url && (k.title || "") === segment);
     if (!match) {
       match = await bmCreate({ parentId, title: segment });
-      const builtPath = joinSegments(cumulative);
-      await markEcho(`folder:${builtPath}`);
-      await markEcho(`node:${match.id}`);
-      inMemoryRecentlyApplied.add(match.id);
+      await markEchoNode(match.id);
     }
     parentId = match.id;
   }
   return parentId;
 }
 
-// ─── Pull + reconcile (the core loop) ───────────────────────────────────────
+// ─── Push: local event → write op + update tree-state ───────────────────────
 
-async function pullAndReconcile() {
+async function pushOps(ops) {
+  const ctx = await getCtx();
+  if (!ctx) return;
+
+  for (const op of ops) {
+    try {
+      // Write the op to the oplog
+      await withAuth((user) => writeOp(ctx.roomId, { ...op, author: user.uid }, user.idToken));
+
+      // Also update the tree-state collections for seeding / display
+      const p = op.payload;
+      await withAuth(async (user) => {
+        switch (op.type) {
+          case "ADD_BOOKMARK":
+            await addBookmark(ctx.roomId, {
+              url: p.url, title: p.title || p.url, favicon: "",
+              path: p.path || "", addedBy: user.uid,
+              addedByName: user.displayName || "", tags: []
+            }, user.idToken);
+            break;
+          case "DEL_BOOKMARK": {
+            const remote = await listBookmarks(ctx.roomId, user.idToken);
+            const match = remote.find(b => b.url === p.url && (b.path || "") === (p.path || ""));
+            if (match?._id) await deleteBookmark(ctx.roomId, match._id, user.idToken);
+            break;
+          }
+          case "ADD_FOLDER":
+            await addFolder(ctx.roomId, { path: p.path, name: p.name || "", createdBy: user.uid }, user.idToken);
+            break;
+          case "DEL_FOLDER": {
+            const folders = await listFolders(ctx.roomId, user.idToken);
+            const match = folders.find(f => f.path === p.path);
+            if (match?._id) await deleteFolder(ctx.roomId, match._id, user.idToken);
+            break;
+          }
+        }
+      });
+    } catch (e) {
+      console.warn("[SW] pushOp failed:", op.type, formatSyncError(e));
+    }
+  }
+}
+
+// ─── Pull: read partner ops → apply locally → mark applied ─────────────────
+
+async function pullAndApplyOps() {
   if (!(await tryAcquireLock())) {
-    console.log("[SW] reconcile already running, marking dirty");
-    await setDirty();
+    console.log("[SW] pull already running, skipping");
     return;
   }
   try {
-    let runAgain = true;
-    let iterations = 0;
-    while (runAgain && iterations < 3) {
-      iterations++;
-      runAgain = false;
-      await runOneReconcileIteration();
-      if (await consumeDirty()) runAgain = true;
+    const ctx = await getCtx();
+    if (!ctx) {
+      console.log("[SW] pull skipped: no auth or no room");
+      return;
     }
+
+    const sharedId = await getSharedFolderId(true);
+
+    // 1. Fetch pending ops from partner
+    let pendingOps;
+    try {
+      pendingOps = await withAuth((user) =>
+        listPendingOps(ctx.roomId, user.uid, user.idToken)
+      );
+    } catch (err) {
+      const friendly = formatSyncError(err);
+      console.warn("[SW] failed to fetch ops:", friendly);
+      if (isQuotaError(err)) {
+        await chrome.storage.local.set({ lastSyncError: friendly });
+        throw err;
+      }
+      return;
+    }
+
+    await chrome.storage.local.remove("lastSyncError");
+
+    if (!pendingOps.length) {
+      console.log("[SW] no pending ops from partner");
+      return;
+    }
+
+    console.log("[SW] applying", pendingOps.length, "ops from partner");
+
+    // 2. Get local tree state
+    const subtree = await getSubTree(sharedId);
+    const localTree = walkTreeToEntities(subtree);
+
+    // 3. Plan mutations
+    const mutations = planOpApplication(pendingOps, localTree);
+
+    // 4. Apply each mutation + mark the op as applied
+    for (const mut of mutations) {
+      try {
+        switch (mut.action) {
+          case "create_folder": {
+            const folderId = await ensureLocalFolderPath(mut.path);
+            // The ensureLocalFolderPath already marks echo for created nodes
+            break;
+          }
+          case "create_bookmark": {
+            const parentId = await ensureLocalFolderPath(mut.path);
+            const node = await bmCreate({ parentId, title: mut.title || mut.url, url: mut.url });
+            await markEchoNode(node.id);
+            break;
+          }
+          case "delete_bookmark": {
+            await markEchoNode(mut.localId);
+            await bmRemove(mut.localId).catch(() => {});
+            break;
+          }
+          case "delete_folder": {
+            await markEchoNode(mut.localId);
+            await bmRemoveTree(mut.localId).catch(() => {});
+            break;
+          }
+          case "skip":
+            console.log("[SW] skip op", mut.opId, ":", mut.reason);
+            break;
+        }
+      } catch (e) {
+        console.warn("[SW] failed to apply mutation:", mut.action, e);
+      }
+
+      // Mark this op as applied regardless (idempotent)
+      if (mut.opId) {
+        try {
+          await withAuth((user) =>
+            markOpApplied(ctx.roomId, mut.opId, user.uid, user.idToken)
+          );
+        } catch (e) {
+          console.warn("[SW] failed to mark op applied:", mut.opId, e);
+        }
+      }
+    }
+
+    // 5. Cleanup applied ops
+    try {
+      await withAuth((user) => deleteAppliedOps(ctx.roomId, user.idToken));
+    } catch (_) { /* best-effort */ }
+
   } catch (err) {
-    console.warn("[SW] pullAndReconcile error:", err);
+    console.warn("[SW] pullAndApplyOps error:", err);
   } finally {
     await releaseLock();
   }
-}
-
-async function runOneReconcileIteration() {
-  const ctx = await getCtx();
-  if (!ctx) {
-    console.log("[SW] reconcile skipped: no auth or no room");
-    return;
-  }
-
-  const sharedId = await getSharedFolderId(true);
-
-  let remoteBookmarks, remoteFolders;
-  try {
-    [remoteBookmarks, remoteFolders] = await withAuth(async (user) => {
-      return Promise.all([
-        listBookmarks(ctx.roomId, user.idToken),
-        listFolders(ctx.roomId, user.idToken)
-      ]);
-    });
-  } catch (err) {
-    const friendly = formatSyncError(err);
-    console.warn("[SW] failed to fetch remote state:", friendly);
-    if (isQuotaError(err)) {
-      // Store the error so the popup can show it
-      await chrome.storage.local.set({ lastSyncError: friendly });
-      throw err;  // propagate so FORCE_SYNC can surface it
-    }
-    return;
-  }
-
-  // Clear any previous sync error on success
-  await chrome.storage.local.remove("lastSyncError");  const subtree = await getSubTree(sharedId);
-  const { folders: localFolders, bookmarks: localBookmarks } = walkTreeToEntities(subtree);
-
-  const stored = await chrome.storage.local.get([
-    "lastSyncedKeys",
-    "lastSyncedFolderPaths",
-    "seedFromRemote",
-    "pendingBookmarkDeletes",
-    "pendingFolderDeletes"
-  ]);
-  const mode = stored.seedFromRemote ? "seed-from-remote" : "normal";
-
-  const plan = planReconcile({
-    remoteBookmarks,
-    remoteFolders,
-    localBookmarks,
-    localFolders,
-    lastSyncedKeys: stored.lastSyncedKeys || [],
-    lastSyncedFolderPaths: stored.lastSyncedFolderPaths || [],
-    pendingLocalDeleteKeys: stored.pendingBookmarkDeletes || [],
-    pendingLocalDeletePaths: stored.pendingFolderDeletes || [],
-    mode
-  });
-
-  console.log("[SW] reconcile mode=", mode,
-    "remote(b=", remoteBookmarks.length, ", f=", remoteFolders.length, ")",
-    "local(b=", localBookmarks.length, ", f=", localFolders.length, ")",
-    "plan: +Lf=", plan.folder.foldersToCreateLocal.length,
-    "+Lb=", plan.bookmark.bookmarksToCreateLocal.length,
-    "-Lb=", plan.bookmark.bookmarksToDeleteLocal.length,
-    "-Lf=", plan.folder.foldersToDeleteLocal.length,
-    "+Rf=", plan.folder.foldersToCreateRemote.length,
-    "+Rb=", plan.bookmark.bookmarksToCreateRemote.length,
-    "-Rb=", plan.bookmark.bookmarksToDeleteRemote.length,
-    "-Rf=", plan.folder.foldersToDeleteRemote.length
-  );
-
-  // 1. Local folder creates
-  for (const f of plan.folder.foldersToCreateLocal) {
-    await ensureLocalFolderPath(f.path);
-  }
-
-  const subtree2 = await getSubTree(sharedId);
-  const folderByPath = new Map();
-  walkTreeToEntities(subtree2).folders.forEach(f => folderByPath.set(f.path, f.id));
-  folderByPath.set("", sharedId);
-
-  // 2. Local bookmark creates
-  for (const b of plan.bookmark.bookmarksToCreateLocal) {
-    const parentId = folderByPath.get(b.path) || (await ensureLocalFolderPath(b.path));
-    try {
-      const node = await bmCreate({ parentId, title: b.title || b.url, url: b.url });
-      await markEcho(`bookmark:${bookmarkKey(b)}`);
-      await markEcho(`node:${node.id}`);
-      inMemoryRecentlyApplied.add(node.id);
-    } catch (_) {}
-  }
-
-  // 3. Local bookmark deletes
-  for (const b of plan.bookmark.bookmarksToDeleteLocal) {
-    if (!b.localId) continue;
-    await markEcho(`bookmark:${bookmarkKey(b)}`);
-    await markEcho(`node:${b.localId}`);
-    inMemoryRecentlyApplied.add(b.localId);
-    await bmRemove(b.localId);
-  }
-
-  // 4. Local folder deletes (longest-first)
-  for (const f of plan.folder.foldersToDeleteLocal) {
-    if (!f.localId) continue;
-    await markEcho(`folder:${folderKey(f)}`);
-    await markEcho(`node:${f.localId}`);
-    inMemoryRecentlyApplied.add(f.localId);
-    await bmRemoveTree(f.localId);
-  }
-
-  // 5/6/7/8. Remote ops with incremental persistence + token refresh
-  const newSyncedFolders = new Set(plan.folder.newLastSyncedFolderPaths);
-  const newSyncedKeys = new Set(plan.bookmark.newLastSyncedKeys);
-
-  for (const f of plan.folder.foldersToCreateRemote) {
-    try {
-      await withAuth((user) => addFolder(ctx.roomId, { path: f.path, name: f.name, createdBy: user.uid }, user.idToken));
-      newSyncedFolders.add(f.path);
-      await persistSets(newSyncedKeys, newSyncedFolders);
-    } catch (e) { console.warn("[SW] addFolder failed:", e); }
-  }
-
-  for (const b of plan.bookmark.bookmarksToCreateRemote) {
-    try {
-      await withAuth((user) => addBookmark(ctx.roomId, {
-        url: b.url,
-        title: b.title || b.url,
-        favicon: "",
-        path: b.path || "",
-        addedBy: user.uid,
-        addedByName: user.displayName || "",
-        tags: []
-      }, user.idToken));
-      newSyncedKeys.add(bookmarkKey(b));
-      await persistSets(newSyncedKeys, newSyncedFolders);
-    } catch (e) { console.warn("[SW] addBookmark failed:", e); }
-  }
-
-  for (const b of plan.bookmark.bookmarksToDeleteRemote) {
-    if (!b._id) continue;
-    try {
-      await withAuth((user) => deleteBookmark(ctx.roomId, b._id, user.idToken));
-      newSyncedKeys.delete(bookmarkKey(b));
-      await persistSets(newSyncedKeys, newSyncedFolders);
-    } catch (e) { console.warn("[SW] deleteBookmark failed:", e); }
-  }
-
-  for (const f of plan.folder.foldersToDeleteRemote) {
-    if (!f._id) continue;
-    try {
-      await withAuth((user) => deleteFolder(ctx.roomId, f._id, user.idToken));
-      newSyncedFolders.delete(f.path);
-      await persistSets(newSyncedKeys, newSyncedFolders);
-    } catch (e) { console.warn("[SW] deleteFolder failed:", e); }
-  }
-
-  await persistSets(newSyncedKeys, newSyncedFolders);
-  if (mode === "seed-from-remote") await chrome.storage.local.remove("seedFromRemote");
-}
-
-async function persistSets(keysSet, foldersSet) {
-  await chrome.storage.local.set({
-    lastSyncedKeys: [...keysSet],
-    lastSyncedFolderPaths: [...foldersSet]
-  });
-}
-
-// ─── Listener push helpers ──────────────────────────────────────────────────
-
-async function pushBookmarkAdd(parentPath, node) {
-  const ctx = await getCtx();
-  if (!ctx) return;
-  const key = `${parentPath}|${node.url}`;
-  if (await isEcho(`bookmark:${key}`) || await isEchoNode(node.id)) return;
-
-  const { lastSyncedKeys = [] } = await chrome.storage.local.get("lastSyncedKeys");
-  if (lastSyncedKeys.includes(key)) return;
-
-  try {
-    await withAuth((user) => addBookmark(ctx.roomId, {
-      url: node.url,
-      title: node.title || node.url,
-      favicon: "",
-      path: parentPath,
-      addedBy: user.uid,
-      addedByName: user.displayName || "",
-      tags: []
-    }, user.idToken));
-    const set = new Set(lastSyncedKeys);
-    set.add(key);
-    await chrome.storage.local.set({ lastSyncedKeys: [...set] });
-  } catch (e) { console.warn("[SW] pushBookmarkAdd failed:", formatSyncError(e)); }
-}
-
-async function pushFolderAdd(folderPath, node) {
-  const ctx = await getCtx();
-  if (!ctx) return;
-  if (!folderPath) return;
-  if (await isEcho(`folder:${folderPath}`) || await isEchoNode(node.id)) return;
-
-  const { lastSyncedFolderPaths = [] } = await chrome.storage.local.get("lastSyncedFolderPaths");
-  if (lastSyncedFolderPaths.includes(folderPath)) return;
-
-  try {
-    await withAuth((user) => addFolder(ctx.roomId, {
-      path: folderPath,
-      name: node.title || "",
-      createdBy: user.uid
-    }, user.idToken));
-    const set = new Set(lastSyncedFolderPaths);
-    set.add(folderPath);
-    await chrome.storage.local.set({ lastSyncedFolderPaths: [...set] });
-  } catch (e) { console.warn("[SW] pushFolderAdd failed:", formatSyncError(e)); }
-}
-
-async function pushBookmarkDelete(parentPath, node) {
-  const ctx = await getCtx();
-  if (!ctx) return;
-  const key = `${parentPath}|${node.url}`;
-  if (await isEcho(`bookmark:${key}`)) return;
-
-  try {
-    const remote = await withAuth((user) => listBookmarks(ctx.roomId, user.idToken));
-    const matches = remote.filter(b => b.url === node.url && (b.path || "") === parentPath);
-    for (const m of matches) {
-      if (m._id) await withAuth((user) => deleteBookmark(ctx.roomId, m._id, user.idToken));
-    }
-    const { lastSyncedKeys = [] } = await chrome.storage.local.get("lastSyncedKeys");
-    const set = new Set(lastSyncedKeys);
-    set.delete(key);
-    await chrome.storage.local.set({ lastSyncedKeys: [...set] });
-  } catch (e) { console.warn("[SW] pushBookmarkDelete failed:", formatSyncError(e)); }
-}
-
-async function pushFolderDelete(folderPath) {
-  const ctx = await getCtx();
-  if (!ctx) return;
-  if (!folderPath) return;
-  if (await isEcho(`folder:${folderPath}`)) return;
-
-  try {
-    const [folders, bookmarks] = await withAuth((user) => Promise.all([
-      listFolders(ctx.roomId, user.idToken),
-      listBookmarks(ctx.roomId, user.idToken)
-    ]));
-    const prefix = folderPath + "/";
-    const fDel = folders.filter(f => f.path === folderPath || (f.path || "").startsWith(prefix));
-    const bDel = bookmarks.filter(b => (b.path || "") === folderPath || (b.path || "").startsWith(prefix));
-
-    for (const b of bDel) if (b._id) await withAuth((user) => deleteBookmark(ctx.roomId, b._id, user.idToken)).catch(() => {});
-    for (const f of fDel) if (f._id) await withAuth((user) => deleteFolder(ctx.roomId, f._id, user.idToken)).catch(() => {});
-
-    const stored = await chrome.storage.local.get(["lastSyncedKeys", "lastSyncedFolderPaths"]);
-    const keySet = new Set(stored.lastSyncedKeys || []);
-    const folderSet = new Set(stored.lastSyncedFolderPaths || []);
-    for (const f of fDel) folderSet.delete(f.path);
-    for (const b of bDel) keySet.delete(`${b.path || ""}|${b.url}`);
-    await chrome.storage.local.set({
-      lastSyncedKeys: [...keySet],
-      lastSyncedFolderPaths: [...folderSet]
-    });
-  } catch (e) { console.warn("[SW] pushFolderDelete failed:", formatSyncError(e)); }
 }
 
 // ─── Bookmark event listeners ───────────────────────────────────────────────
 
 chrome.bookmarks.onCreated.addListener(async (id, node) => {
   try {
-    if (await isLocked()) { await setDirty(); return; }
+    if (await isLocked()) return;
     if (await isEchoNode(id)) return;
 
     const sharedId = await getSharedFolderId();
@@ -642,18 +461,24 @@ chrome.bookmarks.onCreated.addListener(async (id, node) => {
     if (node.url) {
       const parentPath = await parentPathOfNode(node.parentId);
       if (parentPath === null) return;
-      await pushBookmarkAdd(parentPath || "", node);
+      const ops = localEventToOps("add_bookmark", {
+        url: node.url, title: node.title || node.url, path: parentPath || ""
+      });
+      await pushOps(ops);
     } else {
       const folderPath = await pathOfNode(id);
       if (!folderPath) return;
-      await pushFolderAdd(folderPath, node);
+      const ops = localEventToOps("add_folder", {
+        path: folderPath, name: node.title || ""
+      });
+      await pushOps(ops);
     }
-  } catch (e) { console.warn("[SW] onCreated handler failed:", e); }
+  } catch (e) { console.warn("[SW] onCreated failed:", e); }
 });
 
 chrome.bookmarks.onRemoved.addListener(async (id, info) => {
   try {
-    if (await isLocked()) { await setDirty(); return; }
+    if (await isLocked()) return;
     if (await isEchoNode(id)) return;
 
     const node = info?.node;
@@ -670,40 +495,37 @@ chrome.bookmarks.onRemoved.addListener(async (id, info) => {
     }
 
     if (node.url) {
-      const key = `${parentPath}|${node.url}`;
-      // Record IMMEDIATELY so reconcile never recreates this item
-      await addPendingDelete("bookmark", key);
-      await pushBookmarkDelete(parentPath, node);
-      // Only clear pending if push succeeded (Firestore delete worked)
-      await removePendingDelete("bookmark", key);
+      const ops = localEventToOps("del_bookmark", {
+        url: node.url, path: parentPath
+      });
+      await pushOps(ops);
     } else {
       const folderPath = parentPath
         ? `${parentPath}/${encodeSegment(node.title || "")}`
         : encodeSegment(node.title || "");
-      // Record IMMEDIATELY so reconcile never recreates this folder
-      await addPendingDelete("folder", folderPath);
-      await pushFolderDelete(folderPath);
-      // Only clear pending if push succeeded
-      await removePendingDelete("folder", folderPath);
+      const ops = localEventToOps("del_folder", { path: folderPath }, node);
+      await pushOps(ops);
     }
-  } catch (e) { console.warn("[SW] onRemoved handler failed:", e); }
+  } catch (e) { console.warn("[SW] onRemoved failed:", e); }
 });
 
 chrome.bookmarks.onChanged.addListener(async (id) => {
   try {
-    if (await isLocked()) { await setDirty(); return; }
+    if (await isLocked()) return;
+    // Title/URL changes: for now, treat as a full resync trigger
     const path = await pathOfNode(id);
     if (path === null) return;
-    pullAndReconcile().catch(() => {});
+    // Future: could generate RENAME ops
   } catch (_) {}
 });
 
 chrome.bookmarks.onMoved.addListener(async (id) => {
   try {
-    if (await isLocked()) { await setDirty(); return; }
+    if (await isLocked()) return;
+    // Moves: for now, treat as a full resync trigger
     const path = await pathOfNode(id);
     if (path === null) return;
-    pullAndReconcile().catch(() => {});
+    // Future: could generate MOVE ops (del from old + add at new)
   } catch (_) {}
 });
 

@@ -1,19 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// sync-core.js — pure logic for bookmark/folder reconciliation
+// sync-core.js — pure logic for oplog-based bookmark/folder sync
 //
 // No `chrome.*`, no `fetch`, no globals. Inputs and outputs are plain objects.
-// This module is the single source of truth for "what the sync should do
-// given the current state". The service worker is the I/O shell that gathers
-// state, calls into this module, and applies the resulting plan.
+// This module converts Chrome bookmark events into Firestore ops and
+// converts incoming partner ops into local Chrome mutations.
 //
 // Identity:
 //   - Bookmark identity:    `${path}|${url}`     (folder containing it + URL)
 //   - Folder identity:      `${path}`            (slash-separated from shared root)
 //
-// Path encoding: we percent-encode "/" inside individual segments BEFORE
-// joining, so that a folder titled "A/B" doesn't collide with the path
-// "A/B" (folder A containing folder B). Decoding happens on the way back
-// to a Chrome title.
+// Op types:
+//   - ADD_BOOKMARK   { url, title, path }
+//   - DEL_BOOKMARK   { url, path }
+//   - ADD_FOLDER     { path, name }
+//   - DEL_FOLDER     { path }
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Path helpers ───────────────────────────────────────────────────────────
@@ -66,10 +66,7 @@ export function folderKey(f) {
 // ─── Tree walk (pure) ───────────────────────────────────────────────────────
 
 /**
- * Walk a Chrome bookmark subtree object (already fetched via getSubTree)
- * and produce flat lists of folders and bookmarks with computed paths.
- * @param {object} rootNode  Chrome subtree node with optional .children
- * @returns {{folders: Array, bookmarks: Array}}
+ * Walk a Chrome bookmark subtree and produce flat lists of folders and bookmarks.
  */
 export function walkTreeToEntities(rootNode) {
   const folders = [];
@@ -100,207 +97,161 @@ export function walkTreeToEntities(rootNode) {
   return { folders, bookmarks };
 }
 
-// ─── Dedup of remote duplicates ─────────────────────────────────────────────
-
-function _dedupBy(items, keyFn, ageFieldCandidates) {
-  const winners = new Map();
-  const duplicates = [];
-  const ageOf = (it) => {
-    for (const f of ageFieldCandidates) {
-      const v = it?.[f];
-      if (v) return +new Date(v);
-    }
-    return 0;
-  };
-  for (const it of items) {
-    const k = keyFn(it);
-    const cur = winners.get(k);
-    if (!cur) { winners.set(k, it); continue; }
-    if (ageOf(it) < ageOf(cur) || (ageOf(it) === ageOf(cur) && (it._id || "") < (cur._id || ""))) {
-      duplicates.push(cur);
-      winners.set(k, it);
-    } else {
-      duplicates.push(it);
-    }
-  }
-  return { unique: [...winners.values()], duplicates };
-}
-
-export function dedupeRemoteBookmarks(remote) {
-  return _dedupBy(remote || [], bookmarkKey, ["addedAt", "createdAt"]);
-}
-
-export function dedupeRemoteFolders(remote) {
-  return _dedupBy(remote || [], folderKey, ["createdAt"]);
-}
-
-// ─── Diff & plan ────────────────────────────────────────────────────────────
+// ─── Local event → ops ──────────────────────────────────────────────────────
 
 /**
- * Given the current state of a sync (remote, local, last-synced sets),
- * compute the minimum set of operations to converge.
+ * Convert a local Chrome bookmark event into one or more Firestore ops.
  *
- * Decision matrix (per bookmark identity = `path|url`):
+ * For a single bookmark add/delete, returns 1 op.
+ * For a folder delete, returns N ops (one DEL_BOOKMARK per contained bookmark,
+ * one DEL_FOLDER per contained subfolder, plus the folder itself).
  *
- *   local | remote | lastSynced | pendDel | action
- *   ------+--------+------------+---------+----------------------------
- *     ✓   |   ✗    |     ✓      |    *    | partner deleted → delete local
- *     ✓   |   ✗    |     ✗      |    *    | new local add → push to remote
- *     ✗   |   ✓    |     *      |    ✓    | user deleted → delete remote
- *     ✗   |   ✓    |     ✓      |    ✗    | we deleted locally → delete remote
- *     ✗   |   ✓    |     ✗      |    ✗    | new remote add → create local
- *     ✓   |   ✓    |     *      |    *    | no-op, ensure key in newLastSynced
- *     ✗   |   ✗    |     ✓      |    *    | drop from newLastSynced
- *
- * `pendingLocalDeleteKeys` overrides the normal logic: if the user explicitly
- * deleted an item locally (recorded immediately in onRemoved), it is NEVER
- * recreated locally — even if lastSynced is incomplete/empty.
- *
- * In `mode: "seed-from-remote"` (e.g. first reconcile after a room change),
- * lastSynced is ignored and the diff is forced to MERGE: missing-on-one-side
- * items are propagated, never deleted. Pending deletes still win over seed.
+ * @param {"add_bookmark"|"del_bookmark"|"add_folder"|"del_folder"} eventType
+ * @param {object} payload  - { url, title, path, name } as applicable
+ * @param {object} [subtree] - for del_folder: the Chrome subtree that was removed
+ * @returns {Array<{ type: string, payload: object }>}
  */
-export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [], lastSyncedKeys = [], pendingLocalDeleteKeys = [], mode = "normal" }) {
-  const lastSynced = new Set(lastSyncedKeys);
-  const pendingDeletes = new Set(pendingLocalDeleteKeys);
+export function localEventToOps(eventType, payload, subtree) {
+  switch (eventType) {
+    case "add_bookmark":
+      return [{ type: "ADD_BOOKMARK", payload: { url: payload.url, title: payload.title || payload.url, path: payload.path || "" } }];
 
-  const { unique: remote, duplicates: dupRemote } = dedupeRemoteBookmarks(remoteBookmarks);
+    case "del_bookmark":
+      return [{ type: "DEL_BOOKMARK", payload: { url: payload.url, path: payload.path || "" } }];
 
-  const remoteByKey = new Map(remote.map(b => [bookmarkKey(b), b]));
-  const localByKey = new Map(localBookmarks.map(b => [bookmarkKey(b), b]));
+    case "add_folder":
+      return [{ type: "ADD_FOLDER", payload: { path: payload.path, name: payload.name || "" } }];
 
-  const allKeys = new Set([...remoteByKey.keys(), ...localByKey.keys(), ...lastSynced]);
-
-  const bookmarksToCreateLocal = [];
-  const bookmarksToDeleteLocal = [];
-  const bookmarksToCreateRemote = [];
-  // Always schedule duplicates for deletion regardless of mode.
-  const bookmarksToDeleteRemote = dupRemote.map(b => ({ path: b.path || "", url: b.url, _id: b._id }));
-  const newLastSynced = new Set();
-
-  for (const k of allKeys) {
-    if (!k.includes("|")) continue;
-    const l = localByKey.get(k);
-    const r = remoteByKey.get(k);
-    const wasSynced = lastSynced.has(k);
-    const wasPendingDelete = pendingDeletes.has(k);
-
-    if (l && r) {
-      newLastSynced.add(k);
-    } else if (l && !r) {
-      if (mode === "seed-from-remote" || !wasSynced) {
-        bookmarksToCreateRemote.push({ path: l.path, url: l.url, title: l.title });
-        newLastSynced.add(k);
-      } else {
-        bookmarksToDeleteLocal.push({ path: l.path, url: l.url, localId: l.id });
+    case "del_folder": {
+      const ops = [];
+      // If we have the subtree (from onRemoved info.node), generate ops for contents
+      if (subtree) {
+        const { folders, bookmarks } = walkTreeToEntities({
+          children: subtree.children || [],
+          title: subtree.title
+        });
+        // Delete bookmarks inside
+        for (const b of bookmarks) {
+          const fullPath = payload.path && b.path
+            ? `${payload.path}/${b.path}`
+            : payload.path || b.path;
+          ops.push({ type: "DEL_BOOKMARK", payload: { url: b.url, path: fullPath } });
+        }
+        // Delete subfolders (deepest first)
+        const sortedFolders = [...folders].sort((a, b) => pathDepth(b.path) - pathDepth(a.path));
+        for (const f of sortedFolders) {
+          const fullPath = payload.path && f.path
+            ? `${payload.path}/${f.path}`
+            : payload.path || f.path;
+          ops.push({ type: "DEL_FOLDER", payload: { path: fullPath } });
+        }
       }
-    } else if (!l && r) {
-      // If user explicitly deleted this locally (pending delete), always
-      // push the remote delete — never recreate it locally.
-      if (wasPendingDelete) {
-        bookmarksToDeleteRemote.push({ path: r.path || "", url: r.url, _id: r._id });
-      } else if (mode === "seed-from-remote" || !wasSynced) {
-        bookmarksToCreateLocal.push({ path: r.path, url: r.url, title: r.title });
-        newLastSynced.add(k);
-      } else {
-        bookmarksToDeleteRemote.push({ path: r.path || "", url: r.url, _id: r._id });
-      }
+      // Delete the folder itself
+      ops.push({ type: "DEL_FOLDER", payload: { path: payload.path } });
+      return ops;
     }
-    // !l && !r → drop from lastSynced (do nothing)
-  }
 
-  return {
-    bookmarksToCreateLocal,
-    bookmarksToDeleteLocal,
-    bookmarksToCreateRemote,
-    bookmarksToDeleteRemote,
-    newLastSyncedKeys: [...newLastSynced]
-  };
+    default:
+      return [];
+  }
 }
 
+// ─── Incoming ops → local mutations ─────────────────────────────────────────
+
 /**
- * Same decision matrix as `computeBookmarkDiff`, but for folders (identity = path).
- * Output ops are sorted: creates shortest-first (parents before children),
- * deletes longest-first (children before parents).
+ * Given a list of pending ops from the partner and the current local tree,
+ * produce a plan of Chrome bookmark mutations to apply.
+ *
+ * Each mutation is: { action, ...params }
+ *   - { action: "create_folder", path }
+ *   - { action: "create_bookmark", path, url, title }
+ *   - { action: "delete_bookmark", localId, path, url }
+ *   - { action: "delete_folder", localId, path }
+ *   - { action: "skip", opId, reason }
+ *
+ * @param {Array} ops         - pending ops from partner
+ * @param {object} localTree  - { folders: [...], bookmarks: [...] } from walkTreeToEntities
+ * @returns {Array<{ opId, action, ... }>}
  */
-export function computeFolderDiff({ remoteFolders = [], localFolders = [], lastSyncedFolderPaths = [], pendingLocalDeletePaths = [], mode = "normal" }) {
-  const lastSynced = new Set(lastSyncedFolderPaths);
-  const pendingDeletes = new Set(pendingLocalDeletePaths);
+export function planOpApplication(ops, localTree) {
+  const localBookmarksByKey = new Map(
+    localTree.bookmarks.map(b => [bookmarkKey(b), b])
+  );
+  const localFoldersByPath = new Map(
+    localTree.folders.map(f => [f.path, f])
+  );
 
-  const { unique: remote, duplicates: dupRemote } = dedupeRemoteFolders(remoteFolders);
+  const mutations = [];
 
-  const remoteByPath = new Map(remote.map(f => [folderKey(f), f]));
-  const localByPath = new Map(localFolders.map(f => [folderKey(f), f]));
+  for (const op of ops) {
+    const p = op.payload || {};
+    const opId = op._id;
 
-  const allKeys = new Set([...remoteByPath.keys(), ...localByPath.keys(), ...lastSynced]);
-
-  const foldersToCreateLocal = [];
-  const foldersToDeleteLocal = [];
-  const foldersToCreateRemote = [];
-  const foldersToDeleteRemote = dupRemote.map(f => ({ path: f.path || "", _id: f._id }));
-  const newLastSynced = new Set();
-
-  for (const k of allKeys) {
-    if (!k) continue;
-    const l = localByPath.get(k);
-    const r = remoteByPath.get(k);
-    const wasSynced = lastSynced.has(k);
-    // Check if this path or any parent was pending-deleted
-    const wasPendingDelete = pendingDeletes.has(k) ||
-      [...pendingDeletes].some(pd => k.startsWith(pd + "/"));
-
-    if (l && r) {
-      newLastSynced.add(k);
-    } else if (l && !r) {
-      if (mode === "seed-from-remote" || !wasSynced) {
-        foldersToCreateRemote.push({ path: l.path, name: l.name });
-        newLastSynced.add(k);
-      } else {
-        foldersToDeleteLocal.push({ path: l.path, localId: l.id });
+    switch (op.type) {
+      case "ADD_BOOKMARK": {
+        const key = `${p.path || ""}|${p.url}`;
+        if (localBookmarksByKey.has(key)) {
+          mutations.push({ opId, action: "skip", reason: "already exists locally" });
+        } else {
+          mutations.push({ opId, action: "create_bookmark", path: p.path || "", url: p.url, title: p.title || p.url });
+          localBookmarksByKey.set(key, { path: p.path || "", url: p.url, title: p.title });
+        }
+        break;
       }
-    } else if (!l && r) {
-      if (wasPendingDelete) {
-        foldersToDeleteRemote.push({ path: r.path, _id: r._id });
-      } else if (mode === "seed-from-remote" || !wasSynced) {
-        foldersToCreateLocal.push({ path: r.path, name: r.name });
-        newLastSynced.add(k);
-      } else {
-        foldersToDeleteRemote.push({ path: r.path, _id: r._id });
+
+      case "DEL_BOOKMARK": {
+        const key = `${p.path || ""}|${p.url}`;
+        const local = localBookmarksByKey.get(key);
+        if (local?.id) {
+          mutations.push({ opId, action: "delete_bookmark", localId: local.id, path: p.path || "", url: p.url });
+          localBookmarksByKey.delete(key);
+        } else {
+          mutations.push({ opId, action: "skip", reason: "not found locally" });
+        }
+        break;
       }
+
+      case "ADD_FOLDER": {
+        if (localFoldersByPath.has(p.path)) {
+          mutations.push({ opId, action: "skip", reason: "folder already exists" });
+        } else {
+          mutations.push({ opId, action: "create_folder", path: p.path, name: p.name || "" });
+          localFoldersByPath.set(p.path, { path: p.path, name: p.name });
+        }
+        break;
+      }
+
+      case "DEL_FOLDER": {
+        const local = localFoldersByPath.get(p.path);
+        if (local?.id) {
+          mutations.push({ opId, action: "delete_folder", localId: local.id, path: p.path });
+          localFoldersByPath.delete(p.path);
+          for (const [key, b] of localBookmarksByKey) {
+            if ((b.path || "").startsWith(p.path + "/") || b.path === p.path) {
+              localBookmarksByKey.delete(key);
+            }
+          }
+          for (const [fpath] of localFoldersByPath) {
+            if (fpath.startsWith(p.path + "/")) {
+              localFoldersByPath.delete(fpath);
+            }
+          }
+        } else {
+          mutations.push({ opId, action: "skip", reason: "folder not found locally" });
+        }
+        break;
+      }
+
+      default:
+        mutations.push({ opId, action: "skip", reason: `unknown op type: ${op.type}` });
     }
   }
 
-  // Order matters for tree operations.
-  foldersToCreateLocal.sort((a, b) => pathDepth(a.path) - pathDepth(b.path));
-  foldersToCreateRemote.sort((a, b) => pathDepth(a.path) - pathDepth(b.path));
-  foldersToDeleteLocal.sort((a, b) => pathDepth(b.path) - pathDepth(a.path));
-  foldersToDeleteRemote.sort((a, b) => pathDepth(b.path) - pathDepth(a.path));
-
-  return {
-    foldersToCreateLocal,
-    foldersToDeleteLocal,
-    foldersToCreateRemote,
-    foldersToDeleteRemote,
-    newLastSyncedFolderPaths: [...newLastSynced]
-  };
+  return mutations;
 }
 
-/**
- * Convenience: combine folder + bookmark diffs into a single plan.
- */
-export function planReconcile(input) {
-  return {
-    folder: computeFolderDiff(input),
-    bookmark: computeBookmarkDiff(input)
-  };
-}
+// ─── Utility ────────────────────────────────────────────────────────────────
 
-// ─── Echo-suppression bookkeeping ───────────────────────────────────────────
-
-/**
- * Prune entries older than `ttlMs` from a `{ key: timestamp }` map.
- * Returns a new object — does not mutate.
- */
 export function pruneExpired(record, now, ttlMs) {
   const out = {};
   for (const [k, t] of Object.entries(record || {})) {

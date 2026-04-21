@@ -91,7 +91,7 @@ jobs:
               "chrome.bookmarks.onCreated.addListener" \
               "chrome.bookmarks.onRemoved.addListener" \
               "chrome.runtime.onMessage.addListener" \
-              "pullAndReconcile"; do
+              "pullAndApplyOps"; do
             if ! grep -q "$sym" background/service-worker.js; then
               echo "::error::service-worker.js missing required symbol: $sym"
               exit 1
