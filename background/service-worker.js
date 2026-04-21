@@ -486,7 +486,11 @@ chrome.bookmarks.onCreated.addListener(async (id, node) => {
 chrome.bookmarks.onRemoved.addListener(async (id, info) => {
   try {
     if (await isLocked()) return;
-    if (await isEchoNode(id)) return;
+    // NOTE: do NOT check isEchoNode here. The lock already suppresses
+    // pull-initiated removes. Echo entries from pull-creates would
+    // incorrectly swallow user-initiated deletes of synced nodes.
+    // For the rare race where onRemoved fires after lock release,
+    // a redundant DEL op is harmless (idempotent on the partner side).
 
     const node = info?.node;
     if (!node) return;
