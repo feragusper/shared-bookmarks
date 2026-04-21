@@ -268,6 +268,32 @@ describe("computeBookmarkDiff (decision matrix)", () => {
     assert.deepEqual(out.newLastSyncedKeys, ["|http://x"]);
   });
 
+  it("h) pending local delete overrides 'new remote add' — never recreate locally", () => {
+    // User deleted bookmark locally, push failed (quota), lastSynced is empty.
+    // Without pendingLocalDeleteKeys, reconcile would treat this as "new remote add".
+    // With it, reconcile correctly pushes remote delete instead.
+    const out = computeBookmarkDiff({
+      remoteBookmarks: [{ ...sb("", "http://x"), _id: "R1" }],
+      localBookmarks: [],
+      lastSyncedKeys: [],
+      pendingLocalDeleteKeys: ["|http://x"]
+    });
+    assert.deepEqual(out.bookmarksToCreateLocal, []);
+    assert.deepEqual(out.bookmarksToDeleteRemote, [{ path: "", url: "http://x", _id: "R1" }]);
+  });
+
+  it("i) pending delete wins even in seed mode", () => {
+    const out = computeBookmarkDiff({
+      remoteBookmarks: [{ ...sb("a", "http://x"), _id: "R1" }],
+      localBookmarks: [],
+      lastSyncedKeys: [],
+      pendingLocalDeleteKeys: ["a|http://x"],
+      mode: "seed-from-remote"
+    });
+    assert.deepEqual(out.bookmarksToCreateLocal, []);
+    assert.deepEqual(out.bookmarksToDeleteRemote, [{ path: "a", url: "http://x", _id: "R1" }]);
+  });
+
   it("k) idempotent: empty everywhere = empty plan", () => {
     const out = computeBookmarkDiff({
       remoteBookmarks: [], localBookmarks: [], lastSyncedKeys: []
@@ -354,6 +380,43 @@ describe("computeFolderDiff", () => {
     });
     assert.equal(out.foldersToCreateLocal.length, 2);
     assert.deepEqual(out.foldersToCreateLocal.map(f => f.path).sort(), ["Travel/Tips", "Work/Tips"]);
+  });
+
+  it("pending folder delete overrides 'new remote add'", () => {
+    const out = computeFolderDiff({
+      remoteFolders: [sf("Travel", "Travel", { _id: "R1" })],
+      localFolders: [],
+      lastSyncedFolderPaths: [],
+      pendingLocalDeletePaths: ["Travel"]
+    });
+    assert.deepEqual(out.foldersToCreateLocal, []);
+    assert.deepEqual(out.foldersToDeleteRemote, [{ path: "Travel", _id: "R1" }]);
+  });
+
+  it("pending folder delete cascades to child folders", () => {
+    const out = computeFolderDiff({
+      remoteFolders: [
+        sf("Travel", "Travel", { _id: "R1" }),
+        sf("Travel/Japan", "Japan", { _id: "R2" })
+      ],
+      localFolders: [],
+      lastSyncedFolderPaths: [],
+      pendingLocalDeletePaths: ["Travel"]
+    });
+    assert.deepEqual(out.foldersToCreateLocal, []);
+    assert.equal(out.foldersToDeleteRemote.length, 2);
+  });
+
+  it("pending folder delete wins even in seed mode", () => {
+    const out = computeFolderDiff({
+      remoteFolders: [sf("X", "X", { _id: "R" })],
+      localFolders: [],
+      lastSyncedFolderPaths: [],
+      pendingLocalDeletePaths: ["X"],
+      mode: "seed-from-remote"
+    });
+    assert.deepEqual(out.foldersToCreateLocal, []);
+    assert.deepEqual(out.foldersToDeleteRemote, [{ path: "X", _id: "R" }]);
   });
 
   it("seed mode merges instead of deleting", () => {

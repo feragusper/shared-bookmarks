@@ -301,6 +301,27 @@ async function consumeDirty() {
   return false;
 }
 
+// ─── Pending local deletes (survive push failures) ──────────────────────────
+// Recorded IMMEDIATELY in onRemoved before any Firestore call, so that even
+// if the push fails (quota, network), the next reconcile knows the user
+// intentionally deleted this item and won't recreate it locally.
+
+async function addPendingDelete(type, key) {
+  const field = type === "folder" ? "pendingFolderDeletes" : "pendingBookmarkDeletes";
+  const stored = await chrome.storage.local.get(field);
+  const set = new Set(stored[field] || []);
+  set.add(key);
+  await chrome.storage.local.set({ [field]: [...set] });
+}
+
+async function removePendingDelete(type, key) {
+  const field = type === "folder" ? "pendingFolderDeletes" : "pendingBookmarkDeletes";
+  const stored = await chrome.storage.local.get(field);
+  const set = new Set(stored[field] || []);
+  set.delete(key);
+  await chrome.storage.local.set({ [field]: [...set] });
+}
+
 // ─── Local folder ensure path ───────────────────────────────────────────────
 
 async function ensureLocalFolderPath(pathStr) {
@@ -384,7 +405,9 @@ async function runOneReconcileIteration() {
   const stored = await chrome.storage.local.get([
     "lastSyncedKeys",
     "lastSyncedFolderPaths",
-    "seedFromRemote"
+    "seedFromRemote",
+    "pendingBookmarkDeletes",
+    "pendingFolderDeletes"
   ]);
   const mode = stored.seedFromRemote ? "seed-from-remote" : "normal";
 
@@ -395,6 +418,8 @@ async function runOneReconcileIteration() {
     localFolders,
     lastSyncedKeys: stored.lastSyncedKeys || [],
     lastSyncedFolderPaths: stored.lastSyncedFolderPaths || [],
+    pendingLocalDeleteKeys: stored.pendingBookmarkDeletes || [],
+    pendingLocalDeletePaths: stored.pendingFolderDeletes || [],
     mode
   });
 
@@ -645,12 +670,21 @@ chrome.bookmarks.onRemoved.addListener(async (id, info) => {
     }
 
     if (node.url) {
+      const key = `${parentPath}|${node.url}`;
+      // Record IMMEDIATELY so reconcile never recreates this item
+      await addPendingDelete("bookmark", key);
       await pushBookmarkDelete(parentPath, node);
+      // Only clear pending if push succeeded (Firestore delete worked)
+      await removePendingDelete("bookmark", key);
     } else {
       const folderPath = parentPath
         ? `${parentPath}/${encodeSegment(node.title || "")}`
         : encodeSegment(node.title || "");
+      // Record IMMEDIATELY so reconcile never recreates this folder
+      await addPendingDelete("folder", folderPath);
       await pushFolderDelete(folderPath);
+      // Only clear pending if push succeeded
+      await removePendingDelete("folder", folderPath);
     }
   } catch (e) { console.warn("[SW] onRemoved handler failed:", e); }
 });

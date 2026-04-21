@@ -142,21 +142,27 @@ export function dedupeRemoteFolders(remote) {
  *
  * Decision matrix (per bookmark identity = `path|url`):
  *
- *   local | remote | lastSynced | action
- *   ------+--------+------------+----------------------------------
- *     ✓   |   ✗    |     ✓      | partner deleted → delete local
- *     ✓   |   ✗    |     ✗      | new local add → push to remote
- *     ✗   |   ✓    |     ✓      | we deleted locally → delete remote
- *     ✗   |   ✓    |     ✗      | new remote add → create local
- *     ✓   |   ✓    |     *      | no-op, ensure key in newLastSynced
- *     ✗   |   ✗    |     ✓      | drop from newLastSynced
+ *   local | remote | lastSynced | pendDel | action
+ *   ------+--------+------------+---------+----------------------------
+ *     ✓   |   ✗    |     ✓      |    *    | partner deleted → delete local
+ *     ✓   |   ✗    |     ✗      |    *    | new local add → push to remote
+ *     ✗   |   ✓    |     *      |    ✓    | user deleted → delete remote
+ *     ✗   |   ✓    |     ✓      |    ✗    | we deleted locally → delete remote
+ *     ✗   |   ✓    |     ✗      |    ✗    | new remote add → create local
+ *     ✓   |   ✓    |     *      |    *    | no-op, ensure key in newLastSynced
+ *     ✗   |   ✗    |     ✓      |    *    | drop from newLastSynced
+ *
+ * `pendingLocalDeleteKeys` overrides the normal logic: if the user explicitly
+ * deleted an item locally (recorded immediately in onRemoved), it is NEVER
+ * recreated locally — even if lastSynced is incomplete/empty.
  *
  * In `mode: "seed-from-remote"` (e.g. first reconcile after a room change),
  * lastSynced is ignored and the diff is forced to MERGE: missing-on-one-side
- * items are propagated, never deleted.
+ * items are propagated, never deleted. Pending deletes still win over seed.
  */
-export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [], lastSyncedKeys = [], mode = "normal" }) {
+export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [], lastSyncedKeys = [], pendingLocalDeleteKeys = [], mode = "normal" }) {
   const lastSynced = new Set(lastSyncedKeys);
+  const pendingDeletes = new Set(pendingLocalDeleteKeys);
 
   const { unique: remote, duplicates: dupRemote } = dedupeRemoteBookmarks(remoteBookmarks);
 
@@ -177,6 +183,7 @@ export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [],
     const l = localByKey.get(k);
     const r = remoteByKey.get(k);
     const wasSynced = lastSynced.has(k);
+    const wasPendingDelete = pendingDeletes.has(k);
 
     if (l && r) {
       newLastSynced.add(k);
@@ -188,7 +195,11 @@ export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [],
         bookmarksToDeleteLocal.push({ path: l.path, url: l.url, localId: l.id });
       }
     } else if (!l && r) {
-      if (mode === "seed-from-remote" || !wasSynced) {
+      // If user explicitly deleted this locally (pending delete), always
+      // push the remote delete — never recreate it locally.
+      if (wasPendingDelete) {
+        bookmarksToDeleteRemote.push({ path: r.path || "", url: r.url, _id: r._id });
+      } else if (mode === "seed-from-remote" || !wasSynced) {
         bookmarksToCreateLocal.push({ path: r.path, url: r.url, title: r.title });
         newLastSynced.add(k);
       } else {
@@ -212,8 +223,9 @@ export function computeBookmarkDiff({ remoteBookmarks = [], localBookmarks = [],
  * Output ops are sorted: creates shortest-first (parents before children),
  * deletes longest-first (children before parents).
  */
-export function computeFolderDiff({ remoteFolders = [], localFolders = [], lastSyncedFolderPaths = [], mode = "normal" }) {
+export function computeFolderDiff({ remoteFolders = [], localFolders = [], lastSyncedFolderPaths = [], pendingLocalDeletePaths = [], mode = "normal" }) {
   const lastSynced = new Set(lastSyncedFolderPaths);
+  const pendingDeletes = new Set(pendingLocalDeletePaths);
 
   const { unique: remote, duplicates: dupRemote } = dedupeRemoteFolders(remoteFolders);
 
@@ -233,6 +245,9 @@ export function computeFolderDiff({ remoteFolders = [], localFolders = [], lastS
     const l = localByPath.get(k);
     const r = remoteByPath.get(k);
     const wasSynced = lastSynced.has(k);
+    // Check if this path or any parent was pending-deleted
+    const wasPendingDelete = pendingDeletes.has(k) ||
+      [...pendingDeletes].some(pd => k.startsWith(pd + "/"));
 
     if (l && r) {
       newLastSynced.add(k);
@@ -244,7 +259,9 @@ export function computeFolderDiff({ remoteFolders = [], localFolders = [], lastS
         foldersToDeleteLocal.push({ path: l.path, localId: l.id });
       }
     } else if (!l && r) {
-      if (mode === "seed-from-remote" || !wasSynced) {
+      if (wasPendingDelete) {
+        foldersToDeleteRemote.push({ path: r.path, _id: r._id });
+      } else if (mode === "seed-from-remote" || !wasSynced) {
         foldersToCreateLocal.push({ path: r.path, name: r.name });
         newLastSynced.add(k);
       } else {
@@ -291,4 +308,3 @@ export function pruneExpired(record, now, ttlMs) {
   }
   return out;
 }
-
