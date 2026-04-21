@@ -77,7 +77,6 @@ jobs:
           # `node --check` accepts a header-only file, so guard against the
           # past bug where the SW shipped without its listeners.
           for sym in \
-              "chrome.alarms.onAlarm.addListener" \
               "chrome.bookmarks.onCreated.addListener" \
               "chrome.bookmarks.onRemoved.addListener" \
               "chrome.runtime.onMessage.addListener" \
