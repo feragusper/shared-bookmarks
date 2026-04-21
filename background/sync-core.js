@@ -123,32 +123,9 @@ export function localEventToOps(eventType, payload, subtree) {
       return [{ type: "ADD_FOLDER", payload: { path: payload.path, name: payload.name || "" } }];
 
     case "del_folder": {
-      const ops = [];
-      // If we have the subtree (from onRemoved info.node), generate ops for contents
-      if (subtree) {
-        const { folders, bookmarks } = walkTreeToEntities({
-          children: subtree.children || [],
-          title: subtree.title
-        });
-        // Delete bookmarks inside
-        for (const b of bookmarks) {
-          const fullPath = payload.path && b.path
-            ? `${payload.path}/${b.path}`
-            : payload.path || b.path;
-          ops.push({ type: "DEL_BOOKMARK", payload: { url: b.url, path: fullPath } });
-        }
-        // Delete subfolders (deepest first)
-        const sortedFolders = [...folders].sort((a, b) => pathDepth(b.path) - pathDepth(a.path));
-        for (const f of sortedFolders) {
-          const fullPath = payload.path && f.path
-            ? `${payload.path}/${f.path}`
-            : payload.path || f.path;
-          ops.push({ type: "DEL_FOLDER", payload: { path: fullPath } });
-        }
-      }
-      // Delete the folder itself
-      ops.push({ type: "DEL_FOLDER", payload: { path: payload.path } });
-      return ops;
+      // A single DEL_FOLDER op is sufficient — the receiver uses
+      // bmRemoveTree which cascades. No need for per-bookmark ops.
+      return [{ type: "DEL_FOLDER", payload: { path: payload.path } }];
     }
 
     default:

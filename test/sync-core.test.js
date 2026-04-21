@@ -121,7 +121,7 @@ describe("localEventToOps", () => {
     assert.deepEqual(ops[0].payload, { path: "Travel", name: "Travel" });
   });
 
-  it("del_folder with subtree produces ops for all contents + the folder", () => {
+  it("del_folder with subtree produces single DEL_FOLDER op (receiver uses removeTree)", () => {
     const subtree = {
       title: "Travel",
       children: [
@@ -132,13 +132,9 @@ describe("localEventToOps", () => {
       ]
     };
     const ops = localEventToOps("del_folder", { path: "Travel" }, subtree);
-    // Should have: DEL_BOOKMARK(Travel|http://g), DEL_BOOKMARK(Travel/Japan|http://s),
-    //              DEL_FOLDER(Travel/Japan), DEL_FOLDER(Travel)
-    assert.equal(ops.length, 4);
-    assert.equal(ops.filter(o => o.type === "DEL_BOOKMARK").length, 2);
-    assert.equal(ops.filter(o => o.type === "DEL_FOLDER").length, 2);
-    // Last op should be the folder itself
-    assert.equal(ops[ops.length - 1].payload.path, "Travel");
+    assert.equal(ops.length, 1);
+    assert.equal(ops[0].type, "DEL_FOLDER");
+    assert.equal(ops[0].payload.path, "Travel");
   });
 
   it("del_folder without subtree produces just the folder delete", () => {

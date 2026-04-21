@@ -337,9 +337,22 @@ async function pushOps(ops) {
             await addFolder(ctx.roomId, { path: p.path, name: p.name || "", createdBy: user.uid }, user.idToken);
             break;
           case "DEL_FOLDER": {
+            // Delete folder + all children (bookmarks & subfolders) by path prefix
             const folders = await listFolders(ctx.roomId, user.idToken);
-            const match = folders.find(f => f.path === p.path);
-            if (match?._id) await deleteFolder(ctx.roomId, match._id, user.idToken);
+            const bookmarks = await listBookmarks(ctx.roomId, user.idToken);
+            // Delete bookmarks inside this folder (path matches or starts with path/)
+            for (const b of bookmarks) {
+              const bp = b.path || "";
+              if (bp === p.path || bp.startsWith(p.path + "/")) {
+                if (b._id) await deleteBookmark(ctx.roomId, b._id, user.idToken);
+              }
+            }
+            // Delete subfolders (path starts with path/) + the folder itself
+            for (const f of folders) {
+              if (f.path === p.path || f.path.startsWith(p.path + "/")) {
+                if (f._id) await deleteFolder(ctx.roomId, f._id, user.idToken);
+              }
+            }
             break;
           }
         }
@@ -486,11 +499,6 @@ chrome.bookmarks.onCreated.addListener(async (id, node) => {
 chrome.bookmarks.onRemoved.addListener(async (id, info) => {
   try {
     if (await isLocked()) return;
-    // NOTE: do NOT check isEchoNode here. The lock already suppresses
-    // pull-initiated removes. Echo entries from pull-creates would
-    // incorrectly swallow user-initiated deletes of synced nodes.
-    // For the rare race where onRemoved fires after lock release,
-    // a redundant DEL op is harmless (idempotent on the partner side).
 
     const node = info?.node;
     if (!node) return;
@@ -498,6 +506,7 @@ chrome.bookmarks.onRemoved.addListener(async (id, info) => {
     const sharedId = await getSharedFolderId();
     if (!sharedId) return;
 
+    // Check if this node was inside the shared folder
     let parentPath = "";
     if (info.parentId !== sharedId) {
       const p = await pathOfNode(info.parentId);
@@ -515,6 +524,7 @@ chrome.bookmarks.onRemoved.addListener(async (id, info) => {
         ? `${parentPath}/${encodeSegment(node.title || "")}`
         : encodeSegment(node.title || "");
       const ops = localEventToOps("del_folder", { path: folderPath }, node);
+      console.log("[SW] onRemoved: pushing", ops.length, "ops for folder", folderPath);
       await pushOps(ops);
     }
   } catch (e) { console.warn("[SW] onRemoved failed:", e); }
