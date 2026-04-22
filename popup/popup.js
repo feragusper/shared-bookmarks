@@ -65,6 +65,9 @@ async function openSharedFolderInChrome() {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
+  // Show skeleton loading screen while we figure out auth state
+  showScreen("screen-loading");
+
   const stored = await chrome.storage.local.get(["user", "roomId"]);
 
   if (!stored.user) {

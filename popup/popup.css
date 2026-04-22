@@ -905,6 +905,49 @@ input[type="text"]:focus {
 }
 .version-badge:empty { display: none; }
 
+/* ── Skeleton loading ──────────────────────────────────────────────────── */
+.skeleton {
+  background: var(--md-sys-color-surface-container-high);
+  border-radius: var(--md-shape-xs);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes skeletonPulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 0.8; }
+}
+
+.skeleton-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.skeleton-text {
+  height: 12px;
+  border-radius: 6px;
+}
+
+.skeleton-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+}
+
+.skeleton-chip {
+  width: 120px;
+  height: 32px;
+  border-radius: var(--md-shape-sm);
+}
+
+.skeleton-folder-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
 /* ── Focus ring ────────────────────────────────────────────────────────── */
 :focus-visible {
   outline: 2px solid var(--md-sys-color-primary);
