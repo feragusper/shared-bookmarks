@@ -116,6 +116,8 @@ jobs:
             --exclude='create_icons.py' \
             --exclude='README.md' \
             --exclude='.gitignore' \
+            --exclude='.firebaserc' \
+            --exclude='firebase.json' \
             --exclude='firestore.rules' \
             --exclude='dist' \
             --exclude='test' \
